@@ -1,0 +1,432 @@
+name: Code Audit (static + SCA)
+
+# PHASE-2 SCANNING WORKFLOW — see the planning repo's ADR-006 (target selection)
+# and ADR-007 (why this workflow lives in the fork rather than in the evaluation
+# repo).
+#
+# Unlike the phase-1 workflow in murdahlob/code-review-automation-test, this one
+# scans THIS repository's own tree (self-checkout). That is the whole point of
+# the phase-2 fork: the code under test is hosted here, so SARIF paths resolve
+# and results can go to the Security tab, where GitHub's own code-scanning UI
+# becomes part of what is being evaluated.
+#
+# Tools: Semgrep, OSV-Scanner, Trivy (vuln + secret + misconfig), and `npm
+# audit` as the zero-setup baseline (the npm analogue of phase 1's `pnpm audit`
+# — a reference point, not a ranked tool). CodeQL runs in codeql.yml.
+#
+# SARIF is published TWICE on purpose: to Security -> Code scanning (so the
+# native experience is evaluated) and as run artifacts (so the raw files can be
+# diffed offline with jq, per ADR-002).
+#
+# This workflow never installs or executes the application's dependencies.
+# `npm audit` reads package-lock.json only. Nothing here boots the app; DAST is
+# audit-dast.yml.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ master ]
+    paths-ignore:
+      - '**.md'
+
+permissions:
+  contents: read
+  security-events: write
+
+concurrency:
+  group: audit-static-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ---------------------------------------------------------------- SAST
+  semgrep:
+    name: SAST - Semgrep
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # Semgrep runs as a `docker run` step rather than as a `container:` job:
+      # the semgrep/semgrep image is Alpine/musl and ships no glibc loader, so
+      # the glibc-linked Node that Actions injects into container jobs (to run
+      # JavaScript actions such as checkout / upload-sarif) cannot be relied on
+      # inside it. Keeping the scanner in a plain step leaves those actions on
+      # the host runner.
+      #
+      # Rule packs: the generic security packs plus the packs matching this
+      # stack (Node.js / Express / server-side JavaScript, swig templates).
+      # `p/typescript` and `p/react` from the phase-1 workflow are dropped —
+      # NodeGoat has neither.
+      - name: Semgrep scan
+        continue-on-error: true
+        run: |
+          docker run --rm --user 0 \
+            -v "${PWD}:/src" -w /src \
+            semgrep/semgrep \
+            semgrep scan \
+              --config p/default \
+              --config p/security-audit \
+              --config p/secrets \
+              --config p/owasp-top-ten \
+              --config p/javascript \
+              --config p/nodejs \
+              --metrics off \
+              --sarif --output /src/semgrep.sarif
+
+      - name: Record run-manifest fragment (Semgrep)
+        if: always()
+        run: |
+          {
+            echo "## semgrep"
+            echo "image:   $(docker image inspect --format '{{index .RepoDigests 0}}' semgrep/semgrep 2>/dev/null || echo 'not pulled')"
+            echo "version: $(docker run --rm semgrep/semgrep semgrep --version 2>/dev/null || echo 'n/a')"
+            echo "scanned HEAD: $(git rev-parse HEAD 2>/dev/null || echo 'n/a')"
+          } > manifest-semgrep.txt
+
+      - name: Upload run-manifest fragment
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: manifest-semgrep
+          path: manifest-semgrep.txt
+          if-no-files-found: warn
+
+      - name: Upload Semgrep SARIF to Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep
+
+      - name: Upload Semgrep SARIF as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sarif-semgrep
+          path: semgrep.sarif
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------- SCA
+  osv-scanner:
+    name: SCA - OSV-Scanner
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pinned to an exact release: the action has no floating `v1`/`v2` ref,
+      # and its input was renamed `args` -> `scan-args` in v2. One arg per line.
+      - name: Run OSV-Scanner
+        uses: google/osv-scanner-action/osv-scanner-action@v2.3.8
+        continue-on-error: true          # findings must not fail the trial run
+        with:
+          scan-args: |-
+            --recursive
+            --format=sarif
+            --output=osv.sarif
+            ./
+
+      - name: Record run-manifest fragment (OSV-Scanner)
+        if: always()
+        run: |
+          {
+            echo "## osv-scanner"
+            echo "action: google/osv-scanner-action/osv-scanner-action@v2.3.8 (bundles osv-scanner of the same release)"
+            echo "scanned HEAD: $(git rev-parse HEAD 2>/dev/null || echo 'n/a')"
+          } > manifest-osv.txt
+
+      - name: Upload run-manifest fragment
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: manifest-osv
+          path: manifest-osv.txt
+          if-no-files-found: warn
+
+      - name: Upload OSV SARIF to Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: osv.sarif
+          category: osv-scanner
+
+      - name: Upload OSV SARIF as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sarif-osv-scanner
+          path: osv.sarif
+          if-no-files-found: warn
+
+  trivy:
+    name: SCA + secrets + misconfig - Trivy
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # Unlike the phase-1 target, this tree DOES carry a Dockerfile and a
+      # docker-compose.yml, so Trivy's `misconfig` scanner finally has
+      # something to analyse — one of the gaps phase 1 recorded.
+      - name: Trivy filesystem scan
+        uses: aquasecurity/trivy-action@v0.36.0
+        continue-on-error: true
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret,misconfig
+          format: sarif
+          output: trivy.sarif
+
+      - name: Record run-manifest fragment (Trivy)
+        if: always()
+        run: |
+          {
+            echo "## trivy"
+            echo "action: aquasecurity/trivy-action@v0.36.0"
+            trivy --version 2>/dev/null || echo "version: n/a (trivy binary not on PATH)"
+            echo "scanned HEAD: $(git rev-parse HEAD 2>/dev/null || echo 'n/a')"
+          } > manifest-trivy.txt
+
+      - name: Upload run-manifest fragment
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: manifest-trivy
+          path: manifest-trivy.txt
+          if-no-files-found: warn
+
+      - name: Upload Trivy SARIF to Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy.sarif
+          category: trivy
+
+      - name: Upload Trivy SARIF as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sarif-trivy
+          path: trivy.sarif
+          if-no-files-found: warn
+
+  # -------------------------------------------------- zero-setup SCA baseline
+  # `npm audit` is the npm analogue of phase 1's `pnpm audit`: a reference point
+  # for "what do you get with no tool at all", NOT a ranked tool in the trial.
+  # It reads package-lock.json; dependencies are deliberately NOT installed, so
+  # no lifecycle script from this 2016-era tree ever executes in the runner.
+  npm-audit:
+    name: SCA baseline - npm audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: npm audit (JSON)
+        continue-on-error: true          # non-zero exit just means "vulns found"
+        run: |
+          npm audit --package-lock-only --json > npm-audit.json || true
+          npm audit --package-lock-only > npm-audit.txt 2>&1 || true
+          ls -l npm-audit.json npm-audit.txt || true
+
+      - name: Summarise npm audit
+        if: always()
+        run: |
+          {
+            echo "## npm audit (zero-setup baseline)"
+            echo ""
+            if [ -s npm-audit.json ]; then
+              node -e '
+                const a = require("./npm-audit.json");
+                const m = (a.metadata && a.metadata.vulnerabilities) || {};
+                console.log("| severity | count |");
+                console.log("|---|---|");
+                for (const k of ["critical","high","moderate","low","info","total"]) {
+                  if (k in m) console.log(`| ${k} | ${m[k]} |`);
+                }
+                const adv = a.vulnerabilities ? Object.keys(a.vulnerabilities).length : 0;
+                console.log("");
+                console.log(`Advisory-carrying packages: ${adv}`);
+              ' || echo "could not parse npm-audit.json"
+            else
+              echo "**npm audit produced no JSON** - check the step log."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Record run-manifest fragment (npm audit)
+        if: always()
+        run: |
+          {
+            echo "## npm audit"
+            echo "npm:  $(npm --version 2>/dev/null || echo 'n/a')"
+            echo "node: $(node --version 2>/dev/null || echo 'n/a')"
+            echo "scanned HEAD: $(git rev-parse HEAD 2>/dev/null || echo 'n/a')"
+          } > manifest-npm-audit.txt
+
+      - name: Upload run-manifest fragment
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: manifest-npm-audit
+          path: manifest-npm-audit.txt
+          if-no-files-found: warn
+
+      - name: Upload npm audit output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: npm-audit
+          path: |
+            npm-audit.json
+            npm-audit.txt
+          if-no-files-found: warn
+
+  # ------------------------------------------ optional: Snyk Code (needs token)
+  # Enable after adding a SNYK_TOKEN repository secret (free account). Kept
+  # disabled by default so the workflow runs with no account setup at all.
+  #
+  # Safe to enable HERE in a way it was not safe in phase 1: this job checks out
+  # code we own and host, and it never installs or runs the dependency tree, so
+  # the secret does not share a job with the execution of third-party code.
+  # snyk-code:
+  #   name: SAST - Snyk Code
+  #   runs-on: ubuntu-latest
+  #   timeout-minutes: 30
+  #   permissions:
+  #     contents: read
+  #     security-events: write
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - uses: snyk/actions/setup@master
+  #     - name: Snyk Code test
+  #       env:
+  #         SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+  #       run: snyk code test --sarif-file-output=snyk-code.sarif
+  #       continue-on-error: true
+  #     - name: Upload Snyk SARIF to Security tab
+  #       if: always()
+  #       uses: github/codeql-action/upload-sarif@v3
+  #       with:
+  #         sarif_file: snyk-code.sarif
+  #         category: snyk-code
+  #     - name: Upload Snyk SARIF as artifact
+  #       if: always()
+  #       uses: actions/upload-artifact@v4
+  #       with:
+  #         name: sarif-snyk-code
+  #         path: snyk-code.sarif
+  #         if-no-files-found: warn
+
+  # ------------------------------------------------------------- aggregation
+  summary:
+    name: Findings summary
+    runs-on: ubuntu-latest
+    needs: [ semgrep, osv-scanner, trivy, npm-audit ]
+    if: always()
+    timeout-minutes: 10
+    permissions: {}
+    steps:
+      - name: Download all SARIF artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: sarif-*
+          path: sarif
+          merge-multiple: true
+
+      - name: Count findings per SARIF file
+        run: |
+          {
+            echo "## Static audit summary"
+            echo ""
+            echo "Scanned repo: \`${GITHUB_REPOSITORY}\`"
+            echo "Scanned SHA:  \`${GITHUB_SHA}\`"
+            echo ""
+            echo "| SARIF file | results |"
+            echo "|---|---|"
+            shopt -s nullglob
+            for f in sarif/*.sarif; do
+              n=$(jq '[.runs[].results[]?] | length' "$f" 2>/dev/null || echo "parse error")
+              echo "| $(basename "$f") | ${n} |"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Every scan step is `continue-on-error`, so a scanner can die while its
+      # step still reports success — and a missing SARIF simply produces no row
+      # in the table above, masquerading as a clean scan. Each expected SARIF
+      # must exist, be non-empty, and carry at least one rule (a scanner that
+      # loaded zero rules is another silent failure). Any miss fails this job.
+      - name: Verify each expected SARIF was produced
+        run: |
+          fail=0
+          check() {   # $1 = expected SARIF file
+            f="sarif/$1"
+            if [ ! -s "$f" ]; then
+              echo "::error::$1 is missing or empty - its scanner failed silently; check that job's log"
+              fail=1
+              return
+            fi
+            rules=$(jq '.runs[0].tool.driver.rules | length' "$f" 2>/dev/null || echo 0)
+            if [ "${rules:-0}" -eq 0 ]; then
+              echo "::error::$1 has no rules in .runs[0].tool.driver.rules - the scanner loaded zero rules; check that job's log"
+              fail=1
+            fi
+          }
+          check semgrep.sarif
+          check osv.sarif
+          check trivy.sarif
+          exit "$fail"
+
+      # ----------------------------------------------- run manifest assembly
+      - name: Download run-manifest fragments
+        if: always()
+        uses: actions/download-artifact@v4
+        with:
+          pattern: manifest-*
+          path: manifest
+          merge-multiple: true
+
+      - name: Assemble run manifest
+        if: always()
+        run: |
+          {
+            echo "# Static audit run manifest"
+            echo "workflow run: ${GITHUB_RUN_ID} (attempt ${GITHUB_RUN_ATTEMPT:-1})"
+            echo "date (UTC):   $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "repository:   ${GITHUB_REPOSITORY}"
+            echo "scanned SHA:  ${GITHUB_SHA}"
+            echo ""
+            cat manifest/*.txt 2>/dev/null || echo "no per-job fragments recovered"
+          } > run-manifest.txt
+          cat run-manifest.txt
+
+      - name: Upload run manifest
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-manifest
+          path: run-manifest.txt
+          if-no-files-found: warn
+
+      - name: Re-upload combined SARIF bundle
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sarif-all
+          path: sarif/
+          if-no-files-found: warn

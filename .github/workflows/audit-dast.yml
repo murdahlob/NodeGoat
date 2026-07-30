@@ -1,0 +1,373 @@
+name: Code Audit (DAST)
+
+# PHASE-2 DAST WORKFLOW — see the planning repo's ADR-006 / ADR-007.
+#
+# Boots THIS repository's application inside the ephemeral GitHub Actions runner
+# using its own docker-compose (app on :4000 + MongoDB 4.4, seeded by
+# artifacts/db-reset.js), then attacks that in-runner instance with OWASP ZAP
+# (baseline, full active scan, and an authenticated pass), Nuclei and Nikto.
+#
+# SAFETY — this application is INTENTIONALLY VULNERABLE.
+#   * `workflow_dispatch` only — never on push/PR. Active scans send attack
+#     payloads and the app must never come up incidentally.
+#   * The scanned URL is HARDCODED to http://127.0.0.1:4000 inside the runner
+#     and is NOT a workflow input, precisely so this workflow cannot be pointed
+#     at production, shared, or third-party infrastructure.
+#   * The app is NEVER deployed and NEVER exposed. docker-compose publishes
+#     4000 on the runner's own loopback; the runner is destroyed when the job
+#     ends. Nothing is pushed to a registry, a host, or a tunnel.
+#   * MongoDB is only reachable inside the compose network (`expose:`, not
+#     `ports:`), and it is seeded with the app's own throwaway demo accounts.
+#   * Nuclei runs with `-ni` (interactsh disabled) so no OAST callbacks leave
+#     the runner.
+#   * NODE_ENV is set to `production` for the run. docker-compose passes
+#     NODE_ENV through from this job's environment; leaving it empty would
+#     select config/env/development.js, which injects a livereload <script> tag
+#     and would pollute the DAST results with an artefact of the config rather
+#     than of the app.
+#
+# Reports (HTML / JSON / JSONL / SARIF / XML / MD, whatever each tool emits) are
+# uploaded as run artifacts. They are NOT sent to the Security tab: these are
+# runtime URL findings, not source-line findings, so code scanning is the wrong
+# home for them.
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_zap_baseline:
+        description: "Run ZAP baseline (passive) scan"
+        required: false
+        default: true
+        type: boolean
+      run_zap_full:
+        description: "Run ZAP full ACTIVE scan (slow, sends attack payloads)"
+        required: false
+        default: true
+        type: boolean
+      run_zap_authenticated:
+        description: "Run ZAP full ACTIVE scan again, authenticated as the seeded user1 account"
+        required: false
+        default: true
+        type: boolean
+      run_nuclei:
+        description: "Run Nuclei"
+        required: false
+        default: true
+        type: boolean
+      run_nikto:
+        description: "Run Nikto"
+        required: false
+        default: true
+        type: boolean
+      zap_spider_minutes:
+        description: "Minutes ZAP may spend spidering (per scan)"
+        required: false
+        default: "5"
+        type: string
+
+# Least privilege: this workflow checks out this repository and uploads run
+# artifacts (which use the Actions runtime token, not GITHUB_TOKEN scopes), so
+# `contents: read` is all it needs.
+permissions:
+  contents: read
+
+concurrency:
+  group: audit-dast-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  APP_PORT: "4000"
+  TARGET_URL: "http://127.0.0.1:4000"
+  REPORT_DIR: dast-reports
+  NODE_ENV: production
+  # Seeded demo credentials from artifacts/db-reset.js. These are the
+  # application's own published test accounts on a throwaway in-runner database
+  # — they are not secrets and must never be treated as such.
+  DEMO_USER: user1
+  DEMO_PASS: User1_123
+
+jobs:
+  dast:
+    name: DAST - ZAP / Nuclei / Nikto
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare report directory
+        run: |
+          mkdir -p "$REPORT_DIR"
+          # ZAP's container user is not root; make the bind mount writable.
+          chmod 777 "$REPORT_DIR"
+
+      - name: Build application images
+        run: docker compose build
+
+      - name: Start application (app + MongoDB, in-runner only)
+        run: |
+          docker compose up -d
+          docker compose ps
+
+      # The compose command loops until MongoDB accepts connections, then seeds
+      # the database and starts the app, so first response can take a while.
+      - name: Wait for the application to respond
+        run: |
+          for i in $(seq 1 180); do
+            if curl -fsS -o /dev/null "$TARGET_URL/login"; then
+              echo "App is up after ${i}s"
+              curl -sS -D - -o /dev/null "$TARGET_URL/login"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::App did not respond on $TARGET_URL/login within 180s"
+          docker compose logs --no-color || true
+          exit 1
+
+      # Proof the seed data landed: without it the authenticated pass is
+      # meaningless and every scan silently covers the public surface only.
+      - name: Verify seeded login works
+        id: auth
+        run: |
+          code=$(curl -sS -o /dev/null -w '%{http_code}' \
+                   -c cookies.txt \
+                   -d "userName=${DEMO_USER}&password=${DEMO_PASS}" \
+                   "$TARGET_URL/login")
+          echo "POST /login -> HTTP $code"
+          sid=$(awk '/connect\.sid/ {print $7}' cookies.txt | tail -1)
+          if [ -z "$sid" ]; then
+            echo "::warning::no connect.sid cookie returned - seeded login failed; the authenticated ZAP pass will be skipped"
+            echo "authenticated=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          dash=$(curl -sS -o /dev/null -w '%{http_code}' -b cookies.txt "$TARGET_URL/dashboard")
+          echo "GET /dashboard with session -> HTTP $dash"
+          if [ "$dash" != "200" ]; then
+            echo "::warning::session cookie did not reach /dashboard (HTTP $dash) - authenticated pass will be skipped"
+            echo "authenticated=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "authenticated=true" >> "$GITHUB_OUTPUT"
+          # Written to the step output, not the log: it is a throwaway session id
+          # for a throwaway container, but there is no reason to print it.
+          echo "session_cookie=connect.sid=${sid}" >> "$GITHUB_OUTPUT"
+
+      # ------------------------------------------------------------- ZAP
+      - name: ZAP baseline scan (passive, unauthenticated)
+        if: inputs.run_zap_baseline
+        continue-on-error: true          # non-zero exit just means "alerts found"
+        run: |
+          docker run --rm --network host \
+            -v "${PWD}/${REPORT_DIR}:/zap/wrk:rw" \
+            ghcr.io/zaproxy/zaproxy:stable \
+            zap-baseline.py \
+              -t "$TARGET_URL" \
+              -m "${{ inputs.zap_spider_minutes }}" \
+              -r zap-baseline.html \
+              -J zap-baseline.json \
+              -x zap-baseline.xml \
+              -w zap-baseline.md \
+              -I
+
+      - name: ZAP full scan (ACTIVE - sends attack payloads, unauthenticated)
+        if: inputs.run_zap_full
+        continue-on-error: true
+        run: |
+          docker run --rm --network host \
+            -v "${PWD}/${REPORT_DIR}:/zap/wrk:rw" \
+            ghcr.io/zaproxy/zaproxy:stable \
+            zap-full-scan.py \
+              -t "$TARGET_URL" \
+              -m "${{ inputs.zap_spider_minutes }}" \
+              -r zap-full.html \
+              -J zap-full.json \
+              -x zap-full.xml \
+              -w zap-full.md \
+              -I
+
+      # Authenticated pass — phase 1 could not test this class at all (its target
+      # had no seeded accounts), so it is the main new DAST capability of phase 2.
+      #
+      # Mechanism: a session cookie is obtained with curl above and injected into
+      # every ZAP request through ZAP's `replacer` add-on. This is the simplest
+      # reliable form of authenticated scanning with the packaged
+      # `zap-full-scan.py`, but it has a known limitation worth recording with
+      # the results: ZAP may crawl `/logout` and invalidate its own session
+      # part-way through, so coverage of the authenticated surface is
+      # best-effort. A ZAP Automation Framework plan with a proper
+      # authentication + session-management context (which re-authenticates on
+      # logout) is the stronger form and is an explicit next step, not something
+      # this step claims to already do.
+      - name: ZAP full scan (ACTIVE, authenticated as seeded user1)
+        if: inputs.run_zap_authenticated && steps.auth.outputs.authenticated == 'true'
+        continue-on-error: true
+        env:
+          SESSION_COOKIE: ${{ steps.auth.outputs.session_cookie }}
+        run: |
+          docker run --rm --network host \
+            -e SESSION_COOKIE \
+            -v "${PWD}/${REPORT_DIR}:/zap/wrk:rw" \
+            ghcr.io/zaproxy/zaproxy:stable \
+            zap-full-scan.py \
+              -t "$TARGET_URL" \
+              -m "${{ inputs.zap_spider_minutes }}" \
+              -r zap-authenticated.html \
+              -J zap-authenticated.json \
+              -x zap-authenticated.xml \
+              -w zap-authenticated.md \
+              -I \
+              -z "-config replacer.full_list(0).description=auth-cookie \
+                  -config replacer.full_list(0).enabled=true \
+                  -config replacer.full_list(0).matchtype=REQ_HEADER \
+                  -config replacer.full_list(0).matchstr=Cookie \
+                  -config replacer.full_list(0).regex=false \
+                  -config replacer.full_list(0).replacement=${SESSION_COOKIE}"
+
+      - name: Note skipped authenticated scan
+        if: inputs.run_zap_authenticated && steps.auth.outputs.authenticated != 'true'
+        run: |
+          echo "::warning::authenticated ZAP scan skipped - the seeded login check did not succeed. DAST results cover the UNAUTHENTICATED surface only."
+
+      # ---------------------------------------------------------- Nuclei
+      - name: Nuclei scan
+        if: inputs.run_nuclei
+        continue-on-error: true
+        run: |
+          docker run --rm --network host \
+            -v "${PWD}/${REPORT_DIR}:/reports:rw" \
+            projectdiscovery/nuclei:latest \
+              -target "$TARGET_URL" \
+              -ni \
+              -no-color \
+              -stats \
+              -jsonl-export /reports/nuclei.jsonl \
+              -sarif-export /reports/nuclei.sarif \
+              -output /reports/nuclei.txt
+
+      # ----------------------------------------------------------- Nikto
+      # Image is ghcr.io/sullo/nikto — `sullo/nikto` on Docker Hub does not
+      # exist, and in phase 1 `continue-on-error` turned that into a green step
+      # producing no report. Hence the verification step near the end.
+      - name: Nikto scan (HTML report)
+        if: inputs.run_nikto
+        continue-on-error: true
+        run: |
+          docker run --rm --network host \
+            -v "${PWD}/${REPORT_DIR}:/output:rw" \
+            ghcr.io/sullo/nikto:latest \
+              -h "$TARGET_URL" \
+              -maxtime 15m \
+              -Format htm \
+              -o /output/nikto.html
+
+      - name: Nikto scan (JSON report)
+        if: inputs.run_nikto
+        continue-on-error: true
+        run: |
+          docker run --rm --network host \
+            -v "${PWD}/${REPORT_DIR}:/output:rw" \
+            ghcr.io/sullo/nikto:latest \
+              -h "$TARGET_URL" \
+              -maxtime 15m \
+              -Format json \
+              -o /output/nikto.json
+
+      # --------------------------------------------------------- wrap-up
+      - name: Collect application logs
+        if: always()
+        run: |
+          docker compose logs --no-color > "$REPORT_DIR/app.log" 2>&1 || true
+
+      - name: Stop application
+        if: always()
+        run: docker compose down -v || true
+
+      - name: Write run manifest
+        if: always()
+        run: |
+          {
+            echo "# DAST run manifest"
+            echo "workflow run: ${GITHUB_RUN_ID} (attempt ${GITHUB_RUN_ATTEMPT:-1})"
+            echo "date (UTC):   $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "repository:   ${GITHUB_REPOSITORY}"
+            echo "scanned SHA:  ${GITHUB_SHA}"
+            echo "NODE_ENV:     ${NODE_ENV}"
+            echo "authenticated pass ran: ${{ steps.auth.outputs.authenticated == 'true' && inputs.run_zap_authenticated }}"
+            echo ""
+            echo "## scanner images (digest = the exact bits that ran)"
+            for img in ghcr.io/zaproxy/zaproxy:stable projectdiscovery/nuclei:latest ghcr.io/sullo/nikto:latest; do
+              digest=$(docker image inspect --format '{{index .RepoDigests 0}}' "$img" 2>/dev/null \
+                || echo 'not pulled (tool disabled this run)')
+              echo "$img -> $digest"
+            done
+            echo ""
+            echo "## nuclei version"
+            if docker image inspect projectdiscovery/nuclei:latest >/dev/null 2>&1; then
+              docker run --rm projectdiscovery/nuclei:latest -version 2>&1 || true
+            else
+              echo "n/a (nuclei disabled this run)"
+            fi
+          } > run-manifest.txt
+          cat run-manifest.txt
+
+      - name: Upload run manifest
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-manifest
+          path: run-manifest.txt
+          if-no-files-found: warn
+
+      # Every scan step is `continue-on-error`, so one tool dying cannot abort
+      # the run. That also means a tool can fail completely while its step still
+      # reports success. This step turns "enabled but produced nothing" into a
+      # visible warning.
+      - name: Verify each enabled tool produced a report
+        if: always()
+        run: |
+          missing=0
+          check() {   # $1 = human name, $2 = enabled?, $3 = expected file
+            [ "$2" != "true" ] && return 0
+            if [ ! -s "$REPORT_DIR/$3" ]; then
+              echo "::warning::$1 was enabled but produced no $3 - check its step log"
+              missing=$((missing+1))
+            fi
+          }
+          check "ZAP baseline"     "${{ inputs.run_zap_baseline }}" zap-baseline.json
+          check "ZAP full scan"    "${{ inputs.run_zap_full }}"     zap-full.json
+          check "ZAP authenticated" "${{ inputs.run_zap_authenticated && steps.auth.outputs.authenticated == 'true' }}" zap-authenticated.json
+          check "Nuclei"           "${{ inputs.run_nuclei }}"       nuclei.jsonl
+          check "Nikto (HTML)"     "${{ inputs.run_nikto }}"        nikto.html
+          check "Nikto (JSON)"     "${{ inputs.run_nikto }}"        nikto.json
+          echo "TOOLS_MISSING_REPORTS=$missing" >> "$GITHUB_ENV"
+
+      - name: Report summary
+        if: always()
+        run: |
+          {
+            echo "## DAST run summary"
+            echo ""
+            echo "Repository:  \`${GITHUB_REPOSITORY}\` @ \`${GITHUB_SHA}\`"
+            echo "Scanned URL (in-runner only): \`${TARGET_URL}\`"
+            echo "Authenticated pass: \`${{ steps.auth.outputs.authenticated == 'true' && inputs.run_zap_authenticated }}\`"
+            echo ""
+            echo "| report | size |"
+            echo "|---|---|"
+            shopt -s nullglob
+            for f in "$REPORT_DIR"/*; do
+              echo "| $(basename "$f") | $(stat -c%s "$f") bytes |"
+            done
+            if [ "${TOOLS_MISSING_REPORTS:-0}" != "0" ]; then
+              echo ""
+              echo "**${TOOLS_MISSING_REPORTS} enabled tool(s) produced no report** - see warnings above."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload DAST reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dast-reports
+          path: ${{ env.REPORT_DIR }}/
+          if-no-files-found: warn

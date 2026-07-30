@@ -1,0 +1,105 @@
+name: CodeQL (SAST)
+
+# PHASE-2 SCANNING WORKFLOW — see the planning repo's ADR-006 / ADR-007.
+#
+# CodeQL was added as a fourth SAST tool after phase 1 exposed the free-tier
+# cross-file-dataflow gap (ADR-001 amendment). Phase 1 could only run it in
+# `upload: never` mode, because the code lived in someone else's repository and
+# SARIF paths would not have resolved in the Security tab.
+#
+# Here the code is hosted in this repository, so CodeQL runs in its native
+# shape: results go to Security -> Code scanning AND are kept as a run artifact
+# for offline jq comparison against the other scanners' SARIF.
+#
+# `security-extended` is selected deliberately over the default suite: the point
+# of including CodeQL is to test the deepest free analysis available, and
+# NodeGoat's planted flaws (eval injection, NoSQL injection, SSRF, open
+# redirect) are exactly the taint-tracking queries the extended suite adds.
+#
+# JavaScript needs no build step, so there is no autobuild.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ master ]
+    paths-ignore:
+      - '**.md'
+
+permissions:
+  contents: read
+  security-events: write
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  analyze:
+    name: CodeQL - javascript-typescript
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        id: codeql-init
+        uses: github/codeql-action/init@v3
+        with:
+          languages: javascript-typescript
+          queries: security-extended
+
+      - name: CodeQL analyze
+        id: codeql-analyze
+        continue-on-error: true          # a scanner failure must not sink the run
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: codeql
+          output: codeql-results
+          upload: always
+
+      # analyze names the SARIF after the language; normalise the name so the
+      # artifact is predictable.
+      - name: Collect CodeQL SARIF
+        if: always()
+        run: |
+          cp codeql-results/*.sarif codeql.sarif 2>/dev/null \
+            || echo "::warning::CodeQL produced no SARIF - check the analyze step log"
+          if [ -s codeql.sarif ]; then
+            {
+              echo "## CodeQL"
+              echo ""
+              echo "results: $(jq '[.runs[].results[]?] | length' codeql.sarif)"
+              echo "rules:   $(jq '.runs[0].tool.driver.rules | length' codeql.sarif)"
+              echo "scanned SHA: \`${GITHUB_SHA}\`"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Record run manifest (CodeQL)
+        if: always()
+        run: |
+          {
+            echo "# CodeQL run manifest"
+            echo "workflow run: ${GITHUB_RUN_ID} (attempt ${GITHUB_RUN_ATTEMPT:-1})"
+            echo "date (UTC):   $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "repository:   ${GITHUB_REPOSITORY}"
+            echo "scanned SHA:  ${GITHUB_SHA}"
+            echo "action:       github/codeql-action@v3"
+            echo "query suite:  security-extended"
+            echo "bundle:       $("${{ steps.codeql-init.outputs.codeql-path }}" version --format=terse 2>/dev/null || echo 'n/a')"
+          } > run-manifest-codeql.txt
+          cat run-manifest-codeql.txt
+
+      - name: Upload CodeQL SARIF as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sarif-codeql
+          path: |
+            codeql.sarif
+            run-manifest-codeql.txt
+          if-no-files-found: warn
