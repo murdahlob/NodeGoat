@@ -3,6 +3,7 @@ const ProfileHandler = require("./profile");
 const BenefitsHandler = require("./benefits");
 const ContributionsHandler = require("./contributions");
 const AllocationsHandler = require("./allocations");
+const PayrollController = require("./payroll");
 const MemosHandler = require("./memos");
 const ResearchHandler = require("./research");
 const tutorialRouter = require("./tutorial");
@@ -17,6 +18,7 @@ const index = (app, db) => {
     const benefitsHandler = new BenefitsHandler(db);
     const contributionsHandler = new ContributionsHandler(db);
     const allocationsHandler = new AllocationsHandler(db);
+    const payrollController = new PayrollController(db);
     const memosHandler = new MemosHandler(db);
     const researchHandler = new ResearchHandler(db);
 
@@ -58,6 +60,10 @@ const index = (app, db) => {
      app.get("/benefits", isLoggedIn, isAdmin, benefitsHandler.displayBenefits);
      app.post("/benefits", isLoggedIn, isAdmin, benefitsHandler.updateBenefits);
      */
+
+    // Payroll reconciliation endpoints
+    app.get("/payroll/records", isLoggedIn, payrollController.listStaffRecords);
+    app.post("/payroll/records", isLoggedIn, payrollController.amendBenefitStartDate);
 
     // Allocations Page
     app.get("/allocations/:userId", isLoggedIn, allocationsHandler.displayAllocations);
