@@ -8,20 +8,23 @@ function AllocationsHandler(db) {
 
     const allocationsDAO = new AllocationsDAO(db);
 
+    /**
+     * Collect the lookup arguments the allocations view needs from the request.
+     */
+    const readLookupArgs = (req) => ({
+        userId: req.params.userId,
+        threshold: req.query.threshold
+    });
+
     this.displayAllocations = (req, res, next) => {
-        /*
-        // Fix for A4 Insecure DOR -  take user id from session instead of from URL param
-        const { userId } = req.session;
-        */
         const {
-            userId
-        } = req.params;
-        const {
+            userId,
             threshold
-        } = req.query;
+        } = readLookupArgs(req);
 
         allocationsDAO.getByUserIdAndThreshold(userId, threshold, (err, allocations) => {
             if (err) return next(err);
+
             return res.render("allocations", {
                 userId,
                 allocations,
