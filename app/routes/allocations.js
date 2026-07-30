@@ -8,26 +8,30 @@ function AllocationsHandler(db) {
 
     const allocationsDAO = new AllocationsDAO(db);
 
-    this.displayAllocations = (req, res, next) => {
-        /*
-        // Fix for A4 Insecure DOR -  take user id from session instead of from URL param
-        const { userId } = req.session;
-        */
-        const {
-            userId
-        } = req.params;
-        const {
-            threshold
-        } = req.query;
-
+    /* Promise wrapper so the route handler can be written linearly instead of
+     * nesting the render inside the DAO callback. */
+    const fetchAllocations = (userId, threshold) => new Promise((resolve, reject) => {
         allocationsDAO.getByUserIdAndThreshold(userId, threshold, (err, allocations) => {
-            if (err) return next(err);
+            if (err) return reject(err);
+            return resolve(allocations);
+        });
+    });
+
+    this.displayAllocations = async (req, res, next) => {
+        const userId = req.params.userId;
+        const threshold = req.query.threshold;
+
+        try {
+            const allocations = await fetchAllocations(userId, threshold);
+
             return res.render("allocations", {
                 userId,
                 allocations,
                 environmentalScripts
             });
-        });
+        } catch (err) {
+            return next(err);
+        }
     };
 }
 
