@@ -26,57 +26,47 @@ const index = (app, db) => {
     //Middleware to check if user has admin rights
     const isAdmin = sessionHandler.isAdminUserMiddleware;
 
-    // The main page of the app
-    app.get("/", sessionHandler.displayWelcomePage);
+    const registerAccountRoutes = () => {
+        app.get("/", sessionHandler.displayWelcomePage);
+        app.get("/login", sessionHandler.displayLoginPage);
+        app.post("/login", sessionHandler.handleLoginRequest);
+        app.get("/signup", sessionHandler.displaySignupPage);
+        app.post("/signup", sessionHandler.handleSignup);
+        app.get("/logout", sessionHandler.displayLogoutPage);
+        app.get("/dashboard", isLoggedIn, sessionHandler.displayWelcomePage);
+    };
 
-    // Login form
-    app.get("/login", sessionHandler.displayLoginPage);
-    app.post("/login", sessionHandler.handleLoginRequest);
+    const registerEmployeeRoutes = () => {
+        app.get("/profile", isLoggedIn, profileHandler.displayProfile);
+        app.post("/profile", isLoggedIn, profileHandler.handleProfileUpdate);
+        app.get("/benefits", isLoggedIn, benefitsHandler.displayBenefits);
+        app.post("/benefits", isLoggedIn, benefitsHandler.updateBenefits);
+    };
 
-    // Signup form
-    app.get("/signup", sessionHandler.displaySignupPage);
-    app.post("/signup", sessionHandler.handleSignup);
+    const registerInvestmentRoutes = () => {
+        app.get("/contributions", isLoggedIn, contributionsHandler.displayContributions);
+        app.post("/contributions", isLoggedIn, contributionsHandler.handleContributionsUpdate);
+        app.get("/allocations/:userId", isLoggedIn, allocationsHandler.displayAllocations);
+        app.get("/research", isLoggedIn, researchHandler.displayResearch);
+    };
 
-    // Logout page
-    app.get("/logout", sessionHandler.displayLogoutPage);
+    const registerContentRoutes = () => {
+        app.get("/memos", isLoggedIn, memosHandler.displayMemos);
+        app.post("/memos", isLoggedIn, memosHandler.addMemos);
 
-    // The main page of the app
-    app.get("/dashboard", isLoggedIn, sessionHandler.displayWelcomePage);
+        // Handle redirect for learning resources link
+        app.get("/learn", isLoggedIn, (req, res) => {
+            // Insecure way to handle redirects by taking redirect url from query string
+            return res.redirect(req.query.url);
+        });
 
-    // Profile page
-    app.get("/profile", isLoggedIn, profileHandler.displayProfile);
-    app.post("/profile", isLoggedIn, profileHandler.handleProfileUpdate);
+        app.use("/tutorial", tutorialRouter);
+    };
 
-    // Contributions Page
-    app.get("/contributions", isLoggedIn, contributionsHandler.displayContributions);
-    app.post("/contributions", isLoggedIn, contributionsHandler.handleContributionsUpdate);
-
-    // Benefits Page
-    app.get("/benefits", isLoggedIn, benefitsHandler.displayBenefits);
-    app.post("/benefits", isLoggedIn, benefitsHandler.updateBenefits);
-    /* Fix for A7 - checks user role to implement  Function Level Access Control
-     app.get("/benefits", isLoggedIn, isAdmin, benefitsHandler.displayBenefits);
-     app.post("/benefits", isLoggedIn, isAdmin, benefitsHandler.updateBenefits);
-     */
-
-    // Allocations Page
-    app.get("/allocations/:userId", isLoggedIn, allocationsHandler.displayAllocations);
-
-    // Memos Page
-    app.get("/memos", isLoggedIn, memosHandler.displayMemos);
-    app.post("/memos", isLoggedIn, memosHandler.addMemos);
-
-    // Handle redirect for learning resources link
-    app.get("/learn", isLoggedIn, (req, res) => {
-        // Insecure way to handle redirects by taking redirect url from query string
-        return res.redirect(req.query.url);
-    });
-
-    // Research Page
-    app.get("/research", isLoggedIn, researchHandler.displayResearch);
-
-    // Mount tutorial router
-    app.use("/tutorial", tutorialRouter);
+    registerAccountRoutes();
+    registerEmployeeRoutes();
+    registerInvestmentRoutes();
+    registerContentRoutes();
 
     // Error handling middleware
     app.use(ErrorHandler);
