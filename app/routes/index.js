@@ -26,54 +26,36 @@ const index = (app, db) => {
     //Middleware to check if user has admin rights
     const isAdmin = sessionHandler.isAdminUserMiddleware;
 
-    // The main page of the app
+    // Routes reachable without a session
     app.get("/", sessionHandler.displayWelcomePage);
-
-    // Login form
     app.get("/login", sessionHandler.displayLoginPage);
     app.post("/login", sessionHandler.handleLoginRequest);
-
-    // Signup form
     app.get("/signup", sessionHandler.displaySignupPage);
     app.post("/signup", sessionHandler.handleSignup);
-
-    // Logout page
     app.get("/logout", sessionHandler.displayLogoutPage);
 
-    // The main page of the app
-    app.get("/dashboard", isLoggedIn, sessionHandler.displayWelcomePage);
+    // Routes that need a session, declared as [method, path, handler]
+    const sessionRoutes = [
+        ["get", "/dashboard", sessionHandler.displayWelcomePage],
+        ["get", "/profile", profileHandler.displayProfile],
+        ["post", "/profile", profileHandler.handleProfileUpdate],
+        ["get", "/contributions", contributionsHandler.displayContributions],
+        ["post", "/contributions", contributionsHandler.handleContributionsUpdate],
+        ["get", "/benefits", benefitsHandler.displayBenefits],
+        ["post", "/benefits", benefitsHandler.updateBenefits],
+        ["get", "/allocations/:userId", allocationsHandler.displayAllocations],
+        ["get", "/memos", memosHandler.displayMemos],
+        ["post", "/memos", memosHandler.addMemos],
+        ["get", "/research", researchHandler.displayResearch]
+    ];
 
-    // Profile page
-    app.get("/profile", isLoggedIn, profileHandler.displayProfile);
-    app.post("/profile", isLoggedIn, profileHandler.handleProfileUpdate);
-
-    // Contributions Page
-    app.get("/contributions", isLoggedIn, contributionsHandler.displayContributions);
-    app.post("/contributions", isLoggedIn, contributionsHandler.handleContributionsUpdate);
-
-    // Benefits Page
-    app.get("/benefits", isLoggedIn, benefitsHandler.displayBenefits);
-    app.post("/benefits", isLoggedIn, benefitsHandler.updateBenefits);
-    /* Fix for A7 - checks user role to implement  Function Level Access Control
-     app.get("/benefits", isLoggedIn, isAdmin, benefitsHandler.displayBenefits);
-     app.post("/benefits", isLoggedIn, isAdmin, benefitsHandler.updateBenefits);
-     */
-
-    // Allocations Page
-    app.get("/allocations/:userId", isLoggedIn, allocationsHandler.displayAllocations);
-
-    // Memos Page
-    app.get("/memos", isLoggedIn, memosHandler.displayMemos);
-    app.post("/memos", isLoggedIn, memosHandler.addMemos);
+    sessionRoutes.forEach(([method, path, handler]) => app[method](path, isLoggedIn, handler));
 
     // Handle redirect for learning resources link
     app.get("/learn", isLoggedIn, (req, res) => {
         // Insecure way to handle redirects by taking redirect url from query string
         return res.redirect(req.query.url);
     });
-
-    // Research Page
-    app.get("/research", isLoggedIn, researchHandler.displayResearch);
 
     // Mount tutorial router
     app.use("/tutorial", tutorialRouter);
