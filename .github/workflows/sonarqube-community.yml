@@ -49,7 +49,6 @@ jobs:
     permissions:
       contents: read
     env:
-      SONAR_URL: http://localhost:9000
       SONAR_PROJECT_KEY: nodegoat
       OUT_DIR: sonarqube-community
     steps:
@@ -62,6 +61,19 @@ jobs:
         run: |
           sudo sysctl -w vm.max_map_count=262144
           sudo sysctl -w fs.file-max=131072
+
+      # The server URL is the runner's own LAN address rather than `localhost`,
+      # deliberately. `-p 9000:9000` binds 0.0.0.0, so this address resolves both
+      # from the host and from inside any Docker container on the default bridge
+      # — where `localhost` would resolve to the container itself. That keeps the
+      # scan step working whether the scanner runs natively on the runner or in a
+      # container, which is not something we should have to know in advance.
+      - name: Resolve a server URL reachable from host and containers
+        run: |
+          ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+          if [ -z "$ip" ]; then ip=$(ip route get 1.1.1.1 | awk '{print $7; exit}'); fi
+          echo "runner address: $ip"
+          echo "SONAR_URL=http://${ip}:9000" >> "$GITHUB_ENV"
 
       - name: Start SonarQube Community Build
         run: |
@@ -93,10 +105,15 @@ jobs:
       # call until that password is changed, so this is not optional hardening —
       # it is the gate on the whole run. The replacement password is random,
       # masked, and dies with the runner.
+      #
+      # The `Aa1!` prefix is required, not decoration: SonarQube 26.x enforces a
+      # password policy and rejected a plain `openssl rand -hex` value with
+      # `{"result":"Password must contain at least one uppercase character"}`
+      # (HTTP 400) on the first attempt at this job — hex is lowercase-only.
       - name: Change the default admin password and mint an analysis token
         id: auth
         run: |
-          NEWPW="$(openssl rand -hex 20)"
+          NEWPW="Aa1!$(openssl rand -hex 20)"
           echo "::add-mask::$NEWPW"
           code=$(curl -sS -o /tmp/pw.out -w '%{http_code}' -u admin:admin -X POST \
             "$SONAR_URL/api/users/change_password" \
@@ -118,6 +135,14 @@ jobs:
           fi
           echo "::add-mask::$TOKEN"
           echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
+
+          # Auto-provisioning on first analysis would normally cover this; the
+          # explicit create removes one silent failure mode for the cost of one
+          # request. A 400 here means the project already exists.
+          curl -sS -o /dev/null -w 'POST /api/projects/create -> HTTP %{http_code}\n' \
+            -u "admin:$NEWPW" -X POST "$SONAR_URL/api/projects/create" \
+            --data-urlencode "project=$SONAR_PROJECT_KEY" \
+            --data-urlencode "name=$SONAR_PROJECT_KEY" || true
 
       # The scanner runs on the host runner, not from the sonar-scanner-cli
       # image: SonarJS needs a Node.js runtime at analysis time and
