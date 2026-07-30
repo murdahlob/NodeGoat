@@ -154,16 +154,25 @@ jobs:
           echo "session_cookie=connect.sid=${sid}" >> "$GITHUB_OUTPUT"
 
       # ------------------------------------------------------------- ZAP
+      # `zap_spider_minutes` is a dispatch input and therefore attacker-influenced
+      # data as far as the runner is concerned. Interpolating `${{ inputs.* }}`
+      # straight into a `run:` block splices it into the shell before bash ever
+      # sees it, so a crafted value executes. SonarQube Cloud flagged exactly
+      # this in our own harness (Semgrep's `run-shell-injection` had it too, but
+      # buried among the workflow findings we were treating as noise). Passing it
+      # through `env:` and referencing `$ZAP_SPIDER_MINUTES` keeps it a value.
       - name: ZAP baseline scan (passive, unauthenticated)
         if: inputs.run_zap_baseline
         continue-on-error: true          # non-zero exit just means "alerts found"
+        env:
+          ZAP_SPIDER_MINUTES: ${{ inputs.zap_spider_minutes }}
         run: |
           docker run --rm --network host \
             -v "${PWD}/${REPORT_DIR}:/zap/wrk:rw" \
             ghcr.io/zaproxy/zaproxy:stable \
             zap-baseline.py \
               -t "$TARGET_URL" \
-              -m "${{ inputs.zap_spider_minutes }}" \
+              -m "$ZAP_SPIDER_MINUTES" \
               -r zap-baseline.html \
               -J zap-baseline.json \
               -x zap-baseline.xml \
@@ -173,13 +182,15 @@ jobs:
       - name: ZAP full scan (ACTIVE - sends attack payloads, unauthenticated)
         if: inputs.run_zap_full
         continue-on-error: true
+        env:
+          ZAP_SPIDER_MINUTES: ${{ inputs.zap_spider_minutes }}
         run: |
           docker run --rm --network host \
             -v "${PWD}/${REPORT_DIR}:/zap/wrk:rw" \
             ghcr.io/zaproxy/zaproxy:stable \
             zap-full-scan.py \
               -t "$TARGET_URL" \
-              -m "${{ inputs.zap_spider_minutes }}" \
+              -m "$ZAP_SPIDER_MINUTES" \
               -r zap-full.html \
               -J zap-full.json \
               -x zap-full.xml \
@@ -204,6 +215,7 @@ jobs:
         continue-on-error: true
         env:
           SESSION_COOKIE: ${{ steps.auth.outputs.session_cookie }}
+          ZAP_SPIDER_MINUTES: ${{ inputs.zap_spider_minutes }}
         run: |
           docker run --rm --network host \
             -e SESSION_COOKIE \
@@ -211,7 +223,7 @@ jobs:
             ghcr.io/zaproxy/zaproxy:stable \
             zap-full-scan.py \
               -t "$TARGET_URL" \
-              -m "${{ inputs.zap_spider_minutes }}" \
+              -m "$ZAP_SPIDER_MINUTES" \
               -r zap-authenticated.html \
               -J zap-authenticated.json \
               -x zap-authenticated.xml \

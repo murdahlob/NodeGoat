@@ -1,0 +1,287 @@
+name: SonarQube Community (self-hosted in the runner)
+
+# PHASE-2 EXPERIMENT — see the planning repo's ADR-007 (why the scanning
+# workflows live in this fork) and ADR-008 (why any workflow edit moves the
+# pinned scanned commit; this file is part of baseline B3).
+#
+# Purpose: measure SonarQube **Community Edition** against the SonarQube
+# **Cloud** results already recorded for the same code. Same vendor, same tree,
+# same week — the variable under test is the tier. Sonar's security-injection
+# (taint analysis) rules ship in the `jssecurity` rule repository and are a
+# commercial feature; five of Cloud's nine ground-truth catches came from
+# `jssecurity:*` rules, so the expectation is that they are simply absent here.
+# `/api/rules/search?repositories=jssecurity` is drained precisely to answer
+# that question with server data rather than with vendor documentation.
+#
+# The entire SonarQube server lives and dies inside this job: no host to run, no
+# licence, no persistence. That is also the hazard — the results exist only in
+# the server's database, which is destroyed with the runner. Everything is
+# therefore DRAINED to JSON and uploaded as an artifact before the job ends. The
+# artifact is the durable output, exactly as a SARIF file is for the scanners in
+# audit-static.yml, and the verification step below fails loudly when it is
+# missing rather than letting an empty run look clean.
+#
+# Why a separate workflow rather than another job in audit-static.yml: booting
+# Elasticsearch, the web server and the compute engine takes minutes, while
+# every other static tool in that workflow finishes in well under one. A boot
+# failure here would otherwise turn the shared static run red and stall its
+# summary job, contaminating five tools' evidence with one experiment's failure.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ master ]
+    paths-ignore:
+      - '**.md'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sonarqube-community-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  sonarqube-community:
+    name: SAST - SonarQube Community Edition
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      SONAR_URL: http://localhost:9000
+      SONAR_PROJECT_KEY: nodegoat
+      OUT_DIR: sonarqube-community
+    steps:
+      - uses: actions/checkout@v4
+
+      # A documented SonarQube prerequisite, not a workaround: the bundled
+      # Elasticsearch refuses to start below 262144 and the runner default is
+      # 65530. Without this the container exits during bootstrap checks.
+      - name: Raise vm.max_map_count for the bundled Elasticsearch
+        run: |
+          sudo sysctl -w vm.max_map_count=262144
+          sudo sysctl -w fs.file-max=131072
+
+      - name: Start SonarQube Community Build
+        run: |
+          docker run -d --name sonarqube \
+            -p 9000:9000 \
+            --ulimit nofile=131072:131072 \
+            sonarqube:community
+          docker image inspect --format 'image: {{index .RepoDigests 0}}' sonarqube:community || true
+
+      # First boot initialises the embedded database and Elasticsearch indices,
+      # so this is minutes, not seconds. A timeout here is a real result — "it
+      # does not fit in a hosted runner" — hence the container log dump.
+      - name: Wait for the server to report UP
+        run: |
+          for i in $(seq 1 90); do
+            status=$(curl -sS "$SONAR_URL/api/system/status" 2>/dev/null | jq -r '.status // "unreachable"' 2>/dev/null || echo unreachable)
+            echo "attempt $i: $status"
+            if [ "$status" = "UP" ]; then
+              echo "server version: $(curl -sS "$SONAR_URL/api/server/version")"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::SonarQube did not reach status UP within 7.5 minutes - see the container log below"
+          docker logs sonarqube 2>&1 | tail -n 200
+          exit 1
+
+      # SonarQube ships with admin/admin and refuses every authenticated API
+      # call until that password is changed, so this is not optional hardening —
+      # it is the gate on the whole run. The replacement password is random,
+      # masked, and dies with the runner.
+      - name: Change the default admin password and mint an analysis token
+        id: auth
+        run: |
+          NEWPW="$(openssl rand -hex 20)"
+          echo "::add-mask::$NEWPW"
+          code=$(curl -sS -o /tmp/pw.out -w '%{http_code}' -u admin:admin -X POST \
+            "$SONAR_URL/api/users/change_password" \
+            --data-urlencode "login=admin" \
+            --data-urlencode "previousPassword=admin" \
+            --data-urlencode "password=$NEWPW")
+          echo "POST /api/users/change_password -> HTTP $code"
+          if [ "$code" != "204" ] && [ "$code" != "200" ]; then
+            cat /tmp/pw.out || true
+            echo "::error::could not change the default admin password (HTTP $code); the API stays locked until it is changed"
+            exit 1
+          fi
+          TOKEN=$(curl -sS -u "admin:$NEWPW" -X POST \
+            "$SONAR_URL/api/user_tokens/generate" \
+            --data-urlencode "name=ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT:-1}" | jq -r '.token // empty')
+          if [ -z "$TOKEN" ]; then
+            echo "::error::POST /api/user_tokens/generate returned no token"
+            exit 1
+          fi
+          echo "::add-mask::$TOKEN"
+          echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
+
+      # The scanner runs on the host runner, not from the sonar-scanner-cli
+      # image: SonarJS needs a Node.js runtime at analysis time and
+      # ubuntu-latest already ships one, so the vendor action is both the
+      # supported route and the one with the fewest moving parts.
+      #
+      # NO exclusions, deliberately. ADR-007 requires the whole-tree and
+      # application-only figures to come from the same unfiltered scan; filtering
+      # at the scanner would make the raw output disagree with the reported
+      # numbers, which is the phase-1 lesson.
+      - name: Run the scanner against the in-runner server
+        id: scan
+        continue-on-error: true
+        uses: SonarSource/sonarqube-scan-action@v5
+        env:
+          SONAR_HOST_URL: ${{ env.SONAR_URL }}
+          SONAR_TOKEN: ${{ steps.auth.outputs.token }}
+        with:
+          args: >
+            -Dsonar.projectKey=nodegoat
+            -Dsonar.projectName=nodegoat
+            -Dsonar.sources=.
+            -Dsonar.scm.disabled=true
+
+      # Submission is asynchronous: the scanner uploads a report and returns.
+      # Reading measures before the compute engine has processed it yields an
+      # empty project that looks exactly like a clean one.
+      - name: Wait for the compute-engine task
+        continue-on-error: true
+        env:
+          TOKEN: ${{ steps.auth.outputs.token }}
+        run: |
+          if [ ! -f .scannerwork/report-task.txt ]; then
+            echo "::error::.scannerwork/report-task.txt is missing - the scanner never submitted a report"
+            exit 1
+          fi
+          cat .scannerwork/report-task.txt
+          task=$(grep -m1 '^ceTaskId=' .scannerwork/report-task.txt | cut -d= -f2)
+          for i in $(seq 1 60); do
+            status=$(curl -sS -u "$TOKEN:" "$SONAR_URL/api/ce/task?id=$task" | jq -r '.task.status // "UNKNOWN"')
+            echo "attempt $i: $status"
+            case "$status" in
+              SUCCESS)          exit 0 ;;
+              FAILED|CANCELED)  echo "::error::compute-engine task reported $status"; exit 1 ;;
+            esac
+            sleep 5
+          done
+          echo "::error::compute-engine task did not finish within 5 minutes"
+          exit 1
+
+      # The server is ephemeral. Everything that will ever be quotable about
+      # this run has to be on disk before the job ends.
+      - name: Drain the server to JSON
+        if: always()
+        env:
+          TOKEN: ${{ steps.auth.outputs.token }}
+        run: |
+          mkdir -p "$OUT_DIR"
+          get() {   # $1 = api path + query, $2 = output file
+            if ! curl -sS -u "$TOKEN:" "$SONAR_URL/$1" -o "$OUT_DIR/$2"; then
+              echo "::warning::GET /$1 failed"
+              echo '{}' > "$OUT_DIR/$2"
+            fi
+          }
+          curl -sS "$SONAR_URL/api/server/version" -o "$OUT_DIR/server-version.txt" || true
+
+          get "api/system/status"                                                     system-status.json
+          get "api/navigation/global"                                                 navigation-global.json
+          get "api/languages/list"                                                    languages.json
+          get "api/plugins/installed"                                                 plugins-installed.json
+
+          get "api/measures/component?component=$SONAR_PROJECT_KEY&metricKeys=ncloc,files,bugs,vulnerabilities,security_hotspots,code_smells,security_rating,reliability_rating,sqale_rating,duplicated_lines_density" measures.json
+
+          get "api/issues/search?componentKeys=$SONAR_PROJECT_KEY&types=VULNERABILITY&ps=500" vulnerabilities.json
+          get "api/issues/search?componentKeys=$SONAR_PROJECT_KEY&ps=500&p=1"                 issues-p1.json
+          get "api/issues/search?componentKeys=$SONAR_PROJECT_KEY&ps=500&p=2"                 issues-p2.json
+          get "api/hotspots/search?projectKey=$SONAR_PROJECT_KEY&ps=500"                      hotspots.json
+
+          # The direct evidence for or against the taint-rule hypothesis: which
+          # rule repositories this server actually has installed, and whether
+          # `jssecurity` is one of them.
+          get "api/rules/repositories"                        rule-repositories.json
+          get "api/rules/search?repositories=jssecurity&ps=1" rules-jssecurity.json
+          get "api/rules/search?languages=js&ps=1"            rules-js.json
+
+          ls -l "$OUT_DIR"
+
+      - name: Summarise
+        if: always()
+        run: |
+          {
+            echo "## SonarQube Community Build (self-hosted in the runner)"
+            echo ""
+            echo "- server version: \`$(cat "$OUT_DIR/server-version.txt" 2>/dev/null || echo unknown)\`"
+            echo "- edition: \`$(jq -r '.edition // "unknown"' "$OUT_DIR/navigation-global.json" 2>/dev/null)\`"
+            echo "- scanned SHA: \`${GITHUB_SHA}\`"
+            echo ""
+            echo "### Measures"
+            echo ""
+            echo "| metric | value |"
+            echo "|---|---|"
+            jq -r '.component.measures[]? | "| \(.metric) | \(.value) |"' "$OUT_DIR/measures.json" 2>/dev/null || echo "| (unreadable) | |"
+            echo ""
+            echo "### Vulnerabilities"
+            echo ""
+            whole=$(jq -r '.total // 0' "$OUT_DIR/vulnerabilities.json" 2>/dev/null || echo 0)
+            app=$(jq -r '[.issues[]? | select((.component | test("\\.github/workflows/")) | not)] | length' "$OUT_DIR/vulnerabilities.json" 2>/dev/null || echo 0)
+            echo "whole-tree **${whole}**, application-only (excluding \`.github/workflows/**\`) **${app}**"
+            echo ""
+            echo "### Rule repositories present in the reported issues"
+            echo ""
+            echo "| repository | issues |"
+            echo "|---|---|"
+            jq -r '[.issues[]?.rule | split(":")[0]] | group_by(.) | map({r: .[0], n: length}) | sort_by(-.n) | .[] | "| \(.r) | \(.n) |"' "$OUT_DIR/issues-p1.json" 2>/dev/null || true
+            echo ""
+            echo "Rules installed on this server in the \`jssecurity\` repository (Sonar's taint-analysis rules): **$(jq -r '.total // 0' "$OUT_DIR/rules-jssecurity.json" 2>/dev/null)**"
+            echo ""
+            echo "JavaScript rules installed in total: **$(jq -r '.total // 0' "$OUT_DIR/rules-js.json" 2>/dev/null)**"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Same convention as audit-static.yml's SARIF check: the scan step is
+      # `continue-on-error`, so it can die while still reporting success, and an
+      # empty project reads exactly like a clean one. A missing or empty drain
+      # fails the job rather than producing a green run with no data.
+      - name: Verify the drained output exists and is usable
+        if: always()
+        run: |
+          fail=0
+          for f in measures.json vulnerabilities.json issues-p1.json rule-repositories.json; do
+            if [ ! -s "$OUT_DIR/$f" ]; then
+              echo "::error::$f is missing or empty - the server was not drained and its results die with the runner"
+              fail=1
+            fi
+          done
+          if ! jq -e '.component.measures | length > 0' "$OUT_DIR/measures.json" >/dev/null 2>&1; then
+            echo "::error::measures.json carries no measures - the analysis never reached the server"
+            fail=1
+          fi
+          if ! jq -e 'has("total")' "$OUT_DIR/vulnerabilities.json" >/dev/null 2>&1; then
+            echo "::error::vulnerabilities.json is not a valid issue-search response"
+            fail=1
+          fi
+          exit "$fail"
+
+      - name: Capture the container log
+        if: always()
+        run: docker logs sonarqube > "$OUT_DIR/sonarqube-container.log" 2>&1 || true
+
+      - name: Record run-manifest fragment (SonarQube Community)
+        if: always()
+        run: |
+          {
+            echo "## sonarqube community"
+            echo "image:   $(docker image inspect --format '{{index .RepoDigests 0}}' sonarqube:community 2>/dev/null || echo 'not pulled')"
+            echo "version: $(cat "$OUT_DIR/server-version.txt" 2>/dev/null || echo 'n/a')"
+            echo "edition: $(jq -r '.edition // "unknown"' "$OUT_DIR/navigation-global.json" 2>/dev/null || echo 'n/a')"
+            echo "scanner: SonarSource/sonarqube-scan-action@v5"
+            echo "scanned HEAD: $(git rev-parse HEAD 2>/dev/null || echo 'n/a')"
+          } > "$OUT_DIR/manifest-sonarqube-community.txt"
+
+      - name: Upload drained SonarQube results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sonarqube-community
+          path: sonarqube-community/
+          if-no-files-found: error

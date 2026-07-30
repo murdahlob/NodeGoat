@@ -10,9 +10,11 @@ name: Code Audit (static + SCA)
 # and results can go to the Security tab, where GitHub's own code-scanning UI
 # becomes part of what is being evaluated.
 #
-# Tools: Semgrep, OSV-Scanner, Trivy (vuln + secret + misconfig), and `npm
-# audit` as the zero-setup baseline (the npm analogue of phase 1's `pnpm audit`
-# — a reference point, not a ranked tool). CodeQL runs in codeql.yml.
+# Tools: Semgrep, OSV-Scanner, Trivy (vuln + secret + misconfig, run twice —
+# once with defaults and once with dev dependencies included), Snyk Code, Snyk
+# Open Source, and `npm audit` as the zero-setup baseline (the npm analogue of
+# phase 1's `pnpm audit` — a reference point, not a ranked tool). CodeQL runs in
+# codeql.yml; SonarQube Community runs in sonarqube-community.yml.
 #
 # SARIF is published TWICE on purpose: to Security -> Code scanning (so the
 # native experience is evaluated) and as run artifacts (so the raw files can be
@@ -187,6 +189,33 @@ jobs:
           format: sarif
           output: trivy.sarif
 
+      # Second pass, same commit and same action, one flag different. Trivy's
+      # package-lock.json analyzer excludes dev dependencies by default, which is
+      # the leading untested explanation for it reporting 71 advisories where
+      # OSV-Scanner reports 171 and Snyk (with --dev) reports 192.
+      #
+      # Both passes are kept on purpose. Replacing the default pass would settle
+      # the question and destroy the comparison at the same time: `trivy.sarif`
+      # keeps meaning exactly what it meant at B1 and B2, so its numbers stay
+      # comparable across baselines, while `trivy-devdeps.sarif` isolates the
+      # flag as the only variable.
+      #
+      # The action exposes no `--include-dev-deps` input; Trivy reads every flag
+      # from a matching TRIVY_<FLAG> environment variable, which is the supported
+      # route. Artifact only, no Security-tab upload: two categories of the same
+      # scanner over the same tree would double-count the tab.
+      - name: Trivy filesystem scan (--include-dev-deps)
+        uses: aquasecurity/trivy-action@v0.36.0
+        continue-on-error: true
+        env:
+          TRIVY_INCLUDE_DEV_DEPS: "true"
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret,misconfig
+          format: sarif
+          output: trivy-devdeps.sarif
+
       - name: Record run-manifest fragment (Trivy)
         if: always()
         run: |
@@ -194,6 +223,7 @@ jobs:
             echo "## trivy"
             echo "action: aquasecurity/trivy-action@v0.36.0"
             trivy --version 2>/dev/null || echo "version: n/a (trivy binary not on PATH)"
+            echo "passes:  trivy.sarif (defaults) and trivy-devdeps.sarif (TRIVY_INCLUDE_DEV_DEPS=true)"
             echo "scanned HEAD: $(git rev-parse HEAD 2>/dev/null || echo 'n/a')"
           } > manifest-trivy.txt
 
@@ -218,6 +248,14 @@ jobs:
         with:
           name: sarif-trivy
           path: trivy.sarif
+          if-no-files-found: warn
+
+      - name: Upload Trivy dev-deps SARIF as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sarif-trivy-devdeps
+          path: trivy-devdeps.sarif
           if-no-files-found: warn
 
   # -------------------------------------------------- zero-setup SCA baseline
@@ -475,9 +513,36 @@ jobs:
           check semgrep.sarif
           check osv.sarif
           check trivy.sarif
+          check trivy-devdeps.sarif
           check snyk-code.sarif
           check snyk-oss.sarif
           exit "$fail"
+
+      # `npm audit` writes JSON, not SARIF, so the check above cannot see it, and
+      # its upload is `if-no-files-found: warn` — a silent failure would produce a
+      # yellow annotation on an otherwise green run. That is precisely the shape
+      # of the phase-1 Nikto defect: a broken step reporting success while
+      # producing no report. Assert the file explicitly instead.
+      - name: Download npm audit output
+        if: always()
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: npm-audit
+          path: npm-audit
+
+      - name: Verify npm audit produced a parseable report
+        if: always()
+        run: |
+          f=npm-audit/npm-audit.json
+          if [ ! -s "$f" ]; then
+            echo "::error::npm-audit.json is missing or empty - the npm audit job failed silently; check that job's log"
+            exit 1
+          fi
+          if ! jq -e '.metadata.vulnerabilities' "$f" >/dev/null 2>&1; then
+            echo "::error::npm-audit.json carries no .metadata.vulnerabilities - npm audit produced no usable report"
+            exit 1
+          fi
 
       # ----------------------------------------------- run manifest assembly
       - name: Download run-manifest fragments
