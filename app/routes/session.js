@@ -135,54 +135,70 @@ function SessionHandler(db) {
         });
     };
 
-    const validateSignup = (userName, firstName, lastName, password, verify, email, errors) => {
+    /* Field checks applied in order; the first failing rule wins and its
+     * message is written to the matching key on the errors object. */
+    const SIGNUP_RULES = [{
+        field: "userName",
+        errorKey: "userNameError",
+        pattern: /^.{1,20}$/,
+        message: "Invalid user name."
+    }, {
+        field: "firstName",
+        errorKey: "firstNameError",
+        pattern: /^.{1,100}$/,
+        message: "Invalid first name."
+    }, {
+        field: "lastName",
+        errorKey: "lastNameError",
+        pattern: /^.{1,100}$/,
+        message: "Invalid last name."
+    }, {
+        field: "password",
+        errorKey: "passwordError",
+        pattern: /^.{1,20}$/,
+        message: "Password must be 8 to 18 characters" +
+            " including numbers, lowercase and uppercase letters."
+    }];
 
-        const USER_RE = /^.{1,20}$/;
-        const FNAME_RE = /^.{1,100}$/;
-        const LNAME_RE = /^.{1,100}$/;
-        const EMAIL_RE = /^[\S]+@[\S]+\.[\S]+$/;
-        const PASS_RE = /^.{1,20}$/;
-        /*
-        //Fix for A2-2 - Broken Authentication -  requires stronger password
-        //(at least 8 characters with numbers and both lowercase and uppercase letters.)
-        const PASS_RE =/^(?=.*\d)(?=.*[a-z])(?=.*[A-Z]).{8,}$/;
-        */
+    const EMAIL_RE = /^[\S]+@[\S]+\.[\S]+$/;
 
+    const clearErrors = (errors) => {
         errors.userNameError = "";
         errors.firstNameError = "";
         errors.lastNameError = "";
-
         errors.passwordError = "";
         errors.verifyError = "";
         errors.emailError = "";
+    };
 
-        if (!USER_RE.test(userName)) {
-            errors.userNameError = "Invalid user name.";
-            return false;
+    const validateSignup = (userName, firstName, lastName, password, verify, email, errors) => {
+
+        const submitted = {
+            userName,
+            firstName,
+            lastName,
+            password
+        };
+
+        clearErrors(errors);
+
+        for (const rule of SIGNUP_RULES) {
+            if (!rule.pattern.test(submitted[rule.field])) {
+                errors[rule.errorKey] = rule.message;
+                return false;
+            }
         }
-        if (!FNAME_RE.test(firstName)) {
-            errors.firstNameError = "Invalid first name.";
-            return false;
-        }
-        if (!LNAME_RE.test(lastName)) {
-            errors.lastNameError = "Invalid last name.";
-            return false;
-        }
-        if (!PASS_RE.test(password)) {
-            errors.passwordError = "Password must be 8 to 18 characters" +
-                " including numbers, lowercase and uppercase letters.";
-            return false;
-        }
+
         if (password !== verify) {
             errors.verifyError = "Password must match";
             return false;
         }
-        if (email !== "") {
-            if (!EMAIL_RE.test(email)) {
-                errors.emailError = "Invalid email address";
-                return false;
-            }
+
+        if (email !== "" && !EMAIL_RE.test(email)) {
+            errors.emailError = "Invalid email address";
+            return false;
         }
+
         return true;
     };
 
