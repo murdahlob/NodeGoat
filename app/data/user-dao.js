@@ -1,5 +1,3 @@
-const bcrypt = require("bcrypt-nodejs");
-
 /* The UserDAO must be constructed with a connected database object */
 function UserDAO(db) {
 
@@ -13,36 +11,52 @@ function UserDAO(db) {
     }
 
     const usersCol = db.collection("users");
+    const countersCol = db.collection("counters");
 
-    this.addUser = (userName, firstName, lastName, password, email, callback) => {
-
-        // Create user document
+    /**
+     * Build the document persisted for a new signup. Optional fields are only
+     * added when the form supplied them.
+     */
+    const buildUserDocument = (userName, firstName, lastName, password, email) => {
         const user = {
             userName,
             firstName,
             lastName,
             benefitStartDate: this.getRandomFutureDate(),
-            password //received from request param
-            /*
-            // Fix for A2-1 - Broken Auth
-            // Stores password  in a safer way using one way encryption and salt hashing
-            password: bcrypt.hashSync(password, bcrypt.genSaltSync())
-            */
+            password
         };
 
-        // Add email if set
         if (email) {
             user.email = email;
         }
 
-        this.getNextSequence("userId", (err, id) => {
-            if (err) {
-                return callback(err, null);
+        return user;
+    };
+
+    const passwordsMatch = (storedPassword, suppliedPassword) => storedPassword === suppliedPassword;
+
+    /**
+     * Build an error the route layer can tell apart from a database error by
+     * looking at the marker property.
+     */
+    const buildLoginError = (message, marker) => {
+        const loginError = new Error(message);
+        loginError[marker] = true;
+        return loginError;
+    };
+
+    this.addUser = (userName, firstName, lastName, password, email, callback) => {
+        const user = buildUserDocument(userName, firstName, lastName, password, email);
+
+        this.getNextSequence("userId", (sequenceError, id) => {
+            if (sequenceError) {
+                return callback(sequenceError, null);
             }
-            console.log(typeof(id));
 
             user._id = id;
-            usersCol.insert(user, (err, result) => !err ? callback(null, result.ops[0]) : callback(err, null));
+
+            return usersCol.insert(user, (insertError, result) =>
+                insertError ? callback(insertError, null) : callback(null, result.ops[0]));
         });
     };
 
@@ -56,44 +70,25 @@ function UserDAO(db) {
 
     this.validateLogin = (userName, password, callback) => {
 
-        // Helper function to compare passwords
-        const comparePassword = (fromDB, fromUser) => {
-            return fromDB === fromUser;
-            /*
-            // Fix for A2-Broken Auth
-            // compares decrypted password stored in this.addUser()
-            return bcrypt.compareSync(fromDB, fromUser);
-            */
-        };
-
-        // Callback to pass to MongoDB that validates a user document
-        const validateUserDoc = (err, user) => {
-
+        const onUserLoaded = (err, user) => {
             if (err) return callback(err, null);
 
-            if (user) {
-                if (comparePassword(password, user.password)) {
-                    callback(null, user);
-                } else {
-                    const invalidPasswordError = new Error("Invalid password");
-                    // Set an extra field so we can distinguish this from a db error
-                    invalidPasswordError.invalidPassword = true;
-                    callback(invalidPasswordError, null);
-                }
-            } else {
-                const noSuchUserError = new Error("User: " + user + " does not exist");
-                // Set an extra field so we can distinguish this from a db error
-                noSuchUserError.noSuchUser = true;
-                callback(noSuchUserError, null);
+            if (!user) {
+                return callback(buildLoginError(`User: ${userName} does not exist`, "noSuchUser"), null);
             }
+
+            if (!passwordsMatch(user.password, password)) {
+                return callback(buildLoginError("Invalid password", "invalidPassword"), null);
+            }
+
+            return callback(null, user);
         };
 
         usersCol.findOne({
-            userName: userName
-        }, validateUserDoc);
+            userName
+        }, onUserLoaded);
     };
 
-    // This is the good one, see the next function
     this.getUserById = (userId, callback) => {
         usersCol.findOne({
             _id: parseInt(userId)
@@ -102,12 +97,12 @@ function UserDAO(db) {
 
     this.getUserByUserName = (userName, callback) => {
         usersCol.findOne({
-            userName: userName
+            userName
         }, callback);
     };
 
     this.getNextSequence = (name, callback) => {
-        db.collection("counters").findAndModify({
+        countersCol.findAndModify({
                 _id: name
             }, [], {
                 $inc: {
@@ -116,8 +111,8 @@ function UserDAO(db) {
             }, {
                 new: true
             },
-            (err, data) =>  err ? callback(err, null) : callback(null, data.value.seq));
+            (err, data) => err ? callback(err, null) : callback(null, data.value.seq));
     };
 }
 
-module.exports = { UserDAO };
+module.exports = { UserDAO };
