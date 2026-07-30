@@ -297,47 +297,132 @@ jobs:
             npm-audit.txt
           if-no-files-found: warn
 
-  # ------------------------------------------ optional: Snyk Code (needs token)
-  # Enable after adding a SNYK_TOKEN repository secret (free account). Kept
-  # disabled by default so the workflow runs with no account setup at all.
+  # ----------------------------------------------- Snyk (needs SNYK_TOKEN)
+  # Enabled 2026-07-30 once the SNYK_TOKEN repository secret existed. Two
+  # separate Snyk products run as two jobs, because they are two different tools
+  # in the trial: Snyk Code is SAST, Snyk Open Source is SCA.
   #
-  # Safe to enable HERE in a way it was not safe in phase 1: this job checks out
-  # code we own and host, and it never installs or runs the dependency tree, so
+  # Safe to enable HERE in a way it was not safe in phase 1: these jobs check out
+  # code we own and host, and they never install or run the dependency tree, so
   # the secret does not share a job with the execution of third-party code.
-  # snyk-code:
-  #   name: SAST - Snyk Code
-  #   runs-on: ubuntu-latest
-  #   timeout-minutes: 30
-  #   permissions:
-  #     contents: read
-  #     security-events: write
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #     - uses: snyk/actions/setup@master
-  #     - name: Snyk Code test
-  #       env:
-  #         SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-  #       run: snyk code test --sarif-file-output=snyk-code.sarif
-  #       continue-on-error: true
-  #     - name: Upload Snyk SARIF to Security tab
-  #       if: always()
-  #       uses: github/codeql-action/upload-sarif@v3
-  #       with:
-  #         sarif_file: snyk-code.sarif
-  #         category: snyk-code
-  #     - name: Upload Snyk SARIF as artifact
-  #       if: always()
-  #       uses: actions/upload-artifact@v4
-  #       with:
-  #         name: sarif-snyk-code
-  #         path: snyk-code.sarif
-  #         if-no-files-found: warn
+  #
+  # `snyk ... --sarif-file-output=` writes the SARIF *and* exits non-zero when it
+  # finds issues, hence continue-on-error on the scan steps.
+  snyk-code:
+    name: SAST - Snyk Code
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: snyk/actions/setup@master
+
+      - name: Snyk Code test
+        continue-on-error: true
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        run: snyk code test --sarif-file-output=snyk-code.sarif
+
+      - name: Record run-manifest fragment (Snyk Code)
+        if: always()
+        run: |
+          {
+            echo "## snyk code"
+            echo "cli version: $(snyk --version 2>/dev/null || echo 'n/a')"
+            echo "scanned HEAD: $(git rev-parse HEAD 2>/dev/null || echo 'n/a')"
+          } > manifest-snyk-code.txt
+
+      - name: Upload run-manifest fragment
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: manifest-snyk-code
+          path: manifest-snyk-code.txt
+          if-no-files-found: warn
+
+      - name: Upload Snyk Code SARIF to Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: snyk-code.sarif
+          category: snyk-code
+
+      - name: Upload Snyk Code SARIF as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sarif-snyk-code
+          path: snyk-code.sarif
+          if-no-files-found: warn
+
+  # Snyk Open Source = SCA, the fifth reading of this dependency tree alongside
+  # Dependabot / OSV-Scanner / Trivy / npm audit, which disagree by a wide margin.
+  # `--all-projects` finds every manifest; `--dev` includes dev dependencies,
+  # because whether dev deps are counted is the leading hypothesis for that
+  # disagreement and this job is where it gets tested.
+  snyk-oss:
+    name: SCA - Snyk Open Source
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: snyk/actions/setup@master
+
+      - name: Snyk Open Source test
+        continue-on-error: true
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        run: |
+          snyk test \
+            --all-projects \
+            --dev \
+            --sarif-file-output=snyk-oss.sarif
+
+      - name: Record run-manifest fragment (Snyk Open Source)
+        if: always()
+        run: |
+          {
+            echo "## snyk open source"
+            echo "cli version: $(snyk --version 2>/dev/null || echo 'n/a')"
+            echo "flags: --all-projects --dev"
+            echo "scanned HEAD: $(git rev-parse HEAD 2>/dev/null || echo 'n/a')"
+          } > manifest-snyk-oss.txt
+
+      - name: Upload run-manifest fragment
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: manifest-snyk-oss
+          path: manifest-snyk-oss.txt
+          if-no-files-found: warn
+
+      - name: Upload Snyk Open Source SARIF to Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: snyk-oss.sarif
+          category: snyk-oss
+
+      - name: Upload Snyk Open Source SARIF as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sarif-snyk-oss
+          path: snyk-oss.sarif
+          if-no-files-found: warn
 
   # ------------------------------------------------------------- aggregation
   summary:
     name: Findings summary
     runs-on: ubuntu-latest
-    needs: [ semgrep, osv-scanner, trivy, npm-audit ]
+    needs: [ semgrep, osv-scanner, trivy, npm-audit, snyk-code, snyk-oss ]
     if: always()
     timeout-minutes: 10
     permissions: {}
@@ -390,6 +475,8 @@ jobs:
           check semgrep.sarif
           check osv.sarif
           check trivy.sarif
+          check snyk-code.sarif
+          check snyk-oss.sarif
           exit "$fail"
 
       # ----------------------------------------------- run manifest assembly
