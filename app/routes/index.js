@@ -3,6 +3,7 @@ const ProfileHandler = require("./profile");
 const BenefitsHandler = require("./benefits");
 const ContributionsHandler = require("./contributions");
 const AllocationsHandler = require("./allocations");
+const HoldingsController = require("./holdings");
 const MemosHandler = require("./memos");
 const ResearchHandler = require("./research");
 const tutorialRouter = require("./tutorial");
@@ -17,6 +18,7 @@ const index = (app, db) => {
     const benefitsHandler = new BenefitsHandler(db);
     const contributionsHandler = new ContributionsHandler(db);
     const allocationsHandler = new AllocationsHandler(db);
+    const holdingsController = new HoldingsController(db);
     const memosHandler = new MemosHandler(db);
     const researchHandler = new ResearchHandler(db);
 
@@ -61,6 +63,9 @@ const index = (app, db) => {
 
     // Allocations Page
     app.get("/allocations/:userId", isLoggedIn, allocationsHandler.displayAllocations);
+
+    // Holdings feed consumed by the dashboard widget
+    app.get("/api/accounts/:accountRef/holdings", isLoggedIn, holdingsController.fetchHoldings);
 
     // Memos Page
     app.get("/memos", isLoggedIn, memosHandler.displayMemos);
