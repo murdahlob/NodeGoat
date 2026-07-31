@@ -5,7 +5,8 @@ name: Code Audit (DAST)
 # Boots THIS repository's application inside the ephemeral GitHub Actions runner
 # using its own docker-compose (app on :4000 + MongoDB 4.4, seeded by
 # artifacts/db-reset.js), then attacks that in-runner instance with OWASP ZAP
-# (baseline, full active scan, and an authenticated pass), Nuclei and Nikto.
+# (baseline, full active scan, and an authenticated Automation Framework pass),
+# Nuclei and Nikto — plus a scripted two-identity access-control differential.
 #
 # SAFETY — this application is INTENTIONALLY VULNERABLE.
 #   * `workflow_dispatch` only — never on push/PR. Active scans send attack
@@ -34,6 +35,11 @@ name: Code Audit (DAST)
 on:
   workflow_dispatch:
     inputs:
+      run_access_control_diff:
+        description: "Run the scripted two-identity access-control differential (user1 / user2 / admin)"
+        required: false
+        default: true
+        type: boolean
       run_zap_baseline:
         description: "Run ZAP baseline (passive) scan"
         required: false
@@ -45,7 +51,7 @@ on:
         default: true
         type: boolean
       run_zap_authenticated:
-        description: "Run ZAP full ACTIVE scan again, authenticated as the seeded user1 account"
+        description: "Run the ZAP Automation Framework authenticated pass (form auth + session management, as seeded user1)"
         required: false
         default: true
         type: boolean
@@ -82,9 +88,15 @@ env:
   NODE_ENV: production
   # Seeded demo credentials from artifacts/db-reset.js. These are the
   # application's own published test accounts on a throwaway in-runner database
-  # — they are not secrets and must never be treated as such.
-  DEMO_USER: user1
+  # — they are not secrets and must never be treated as such. All three are
+  # listed because the access-control differential is a comparison BETWEEN
+  # identities: one account cannot express it.
+  DEMO_USER: user1              # _id 2, ordinary user
   DEMO_PASS: User1_123
+  DEMO_USER2: user2             # _id 3, the other ordinary user
+  DEMO_PASS2: User2_123
+  DEMO_ADMIN: admin             # _id 1, isAdmin: true
+  DEMO_ADMIN_PASS: Admin_123
 
 jobs:
   dast:
@@ -135,9 +147,8 @@ jobs:
                    -d "userName=${DEMO_USER}&password=${DEMO_PASS}" \
                    "$TARGET_URL/login")
           echo "POST /login -> HTTP $code"
-          sid=$(awk '/connect\.sid/ {print $7}' cookies.txt | tail -1)
-          if [ -z "$sid" ]; then
-            echo "::warning::no connect.sid cookie returned - seeded login failed; the authenticated ZAP pass will be skipped"
+          if ! grep -q 'connect\.sid' cookies.txt; then
+            echo "::warning::no connect.sid cookie returned - seeded login failed; the authenticated ZAP pass and the access-control differential will be skipped"
             echo "authenticated=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -148,10 +159,149 @@ jobs:
             echo "authenticated=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          rm -f cookies.txt
           echo "authenticated=true" >> "$GITHUB_OUTPUT"
-          # Written to the step output, not the log: it is a throwaway session id
-          # for a throwaway container, but there is no reason to print it.
-          echo "session_cookie=connect.sid=${sid}" >> "$GITHUB_OUTPUT"
+
+      # ------------------------------- two-identity access-control differential
+      # WHY THIS STEP EXISTS, AND WHY IT IS NOT A ZAP SCAN.
+      #
+      # GT-11 (IDOR on /allocations/:userId) and GT-16 (missing function-level
+      # access control on /benefits) are the two ground-truth defects no static
+      # tool in the trial found. They are also invisible to a scanner driving
+      # ONE identity: nothing about `GET /allocations/3` looks wrong on the wire
+      # — the response is a well-formed 200. The defect exists only in the
+      # relationship between two identities: user1 may fetch a resource owned by
+      # user2, and a non-admin may reach an admin-only route.
+      #
+      # ZAP's passive and active scanners do not express that comparison, so
+      # dressing an ordinary authenticated scan up as a "differential" would be
+      # a claim about the method that is not true. This step states the
+      # experiment directly instead: log in as three seeded identities, issue
+      # the SAME requests as each, and record where the answers differ from what
+      # an access-controlled application would return. Positive and negative
+      # controls are included so that a 200 cannot be read as "the probe was
+      # broken", and every raw response body is uploaded so the verdict column
+      # can be re-derived rather than trusted.
+      #
+      # It runs BEFORE any scanner: the active scan fuzzes every parameter it
+      # finds and would mutate the seeded data this comparison depends on.
+      - name: Two-identity access-control differential (user1 / user2 / admin)
+        id: acdiff
+        if: inputs.run_access_control_diff && steps.auth.outputs.authenticated == 'true'
+        continue-on-error: true
+        run: |
+          set -u
+          TSV="$REPORT_DIR/access-control-differential.tsv"
+          BODIES="$REPORT_DIR/access-control-bodies"
+          mkdir -p "$BODIES"
+          printf 'id\tidentity\tmethod\tpath\thttp_code\tmarker\tmarker_seen\tsecure_expectation\tobserved\tground_truth\n' > "$TSV"
+
+          login() {   # $1 = jar name, $2 = userName, $3 = password
+            jar="$RUNNER_TEMP/jar-$1.txt"
+            : > "$jar"
+            curl -sS -o /dev/null -c "$jar" \
+              -d "userName=$2&password=$3" "$TARGET_URL/login"
+            if ! grep -q 'connect\.sid' "$jar"; then
+              echo "::error::could not log in as $2 - the differential cannot run"
+              return 1
+            fi
+            echo "logged in as $2"
+          }
+
+          : > "$RUNNER_TEMP/jar-anon.txt"
+          login user1 "$DEMO_USER"  "$DEMO_PASS"
+          login user2 "$DEMO_USER2" "$DEMO_PASS2"
+          login admin "$DEMO_ADMIN" "$DEMO_ADMIN_PASS"
+
+          # $1 id  $2 identity  $3 method  $4 path  $5 body  $6 marker
+          # $7 secure_expectation (allowed|denied)  $8 ground-truth row
+          probe() {
+            jar="$RUNNER_TEMP/jar-$2.txt"
+            body_file="$BODIES/$1.html"
+            if [ "$3" = "POST" ]; then
+              code=$(curl -sS -o "$body_file" -w '%{http_code}' -b "$jar" -c "$jar" \
+                       -d "$5" "$TARGET_URL$4")
+            else
+              code=$(curl -sS -o "$body_file" -w '%{http_code}' -b "$jar" "$TARGET_URL$4")
+            fi
+            seen=no
+            if [ -n "$6" ] && grep -qF -- "$6" "$body_file"; then seen=yes; fi
+
+            # "observed" is derived only from the two facts on the row, so a
+            # reader can re-derive it from the raw data.
+            if [ "$7" = "denied" ]; then
+              if [ "$code" = "200" ] && [ "$seen" = "yes" ]; then
+                observed="ACCESS GRANTED - defect confirmed"
+              elif [ "$code" = "200" ]; then
+                observed="200 but marker absent - inconclusive"
+              else
+                observed="denied (HTTP $code)"
+              fi
+            else
+              if [ "$code" = "200" ] && [ "$seen" = "yes" ]; then
+                observed="control OK"
+              else
+                observed="CONTROL FAILED (HTTP $code, marker $seen)"
+              fi
+            fi
+            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+              "$1" "$2" "$3" "$4" "$code" "$6" "$seen" "$7" "$observed" "$8" >> "$TSV"
+            echo "$1 [$2] $3 $4 -> $code | marker '$6' seen=$seen | $observed"
+          }
+
+          # --- controls: prove authentication itself works, so that a 200 in
+          #     the rows below is an AUTHORIZATION result and not a broken probe
+          probe P1 anon  GET /allocations/3 "" ""                                 denied  control-authn
+          probe P2 user1 GET /allocations/2 "" "Asset Allocations for John Doe"   allowed control-positive
+          probe P6 anon  GET /benefits      "" ""                                 denied  control-authn
+          probe P7 admin GET /benefits      "" "Employee ID"                      allowed control-positive
+
+          # --- GT-11: horizontal privilege escalation, both directions and up
+          probe P3 user1 GET /allocations/3 "" "Asset Allocations for Will Smith" denied  GT-11
+          probe P4 user2 GET /allocations/2 "" "Asset Allocations for John Doe"   denied  GT-11
+          probe P5 user1 GET /allocations/1 "" "Asset Allocations for Node Goat"  denied  GT-11
+
+          # --- GT-16: an admin-only function reached by an ordinary user, read...
+          probe P8 user1 GET /benefits      "" "Employee ID"                      denied  GT-16
+
+          # ...and write. P9 mutates ANOTHER user's benefit start date; P10 is
+          # the independent confirmation, read back through the admin account,
+          # that the write landed in the database rather than merely rendering a
+          # success page.
+          probe P9  user1 POST /benefits "userId=3&benefitStartDate=2099-12-31" "Benefits updated successfully." denied GT-16
+          probe P10 admin GET  /benefits "" "2099-12-31"                                                         denied GT-16
+
+          {
+            echo "## Two-identity access-control differential"
+            echo ""
+            echo "Seeded identities: \`admin\` (_id 1, isAdmin), \`user1\` (_id 2), \`user2\` (_id 3)."
+            echo "Every row is the SAME request issued by a different identity."
+            echo ""
+            echo "| id | identity | request | HTTP | marker seen | a secure app would | observed | GT |"
+            echo "|---|---|---|---|---|---|---|---|"
+            # awk, not `while read`: with IFS set to tab, bash collapses runs of
+            # tabs, so the control rows (which carry an empty marker field) would
+            # silently shift every column left by one.
+            awk -F'\t' 'NR>1 {
+              printf "| %s | `%s` | `%s %s` | %s | %s | %s | **%s** | %s |\n",
+                     $1, $2, $3, $4, $5, $7, $8, $9, $10
+            }' "$TSV"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Machine-readable copy alongside the TSV, so the result can be diffed
+          # with jq like every other artifact in the trial (ADR-002).
+          tail -n +2 "$TSV" | jq -Rn '[inputs | split("\t") | {
+              id: .[0], identity: .[1], method: .[2], path: .[3],
+              http_code: .[4], marker: .[5], marker_seen: .[6],
+              secure_expectation: .[7], observed: .[8], ground_truth: .[9]
+            }]' > "$REPORT_DIR/access-control-differential.json"
+
+          confirmed=$(awk -F'\t' 'NR>1 && $9 ~ /defect confirmed/ {print $10}' "$TSV" | sort -u | paste -sd, -)
+          failed_controls=$(awk -F'\t' 'NR>1 && $9 ~ /CONTROL FAILED/ {print $1}' "$TSV" | paste -sd, -)
+          echo "confirmed=${confirmed:-none}" >> "$GITHUB_OUTPUT"
+          echo "failed_controls=${failed_controls:-none}" >> "$GITHUB_OUTPUT"
+          echo "ground-truth rows confirmed by the differential: ${confirmed:-none}"
+          echo "failed controls: ${failed_controls:-none}"
 
       # ------------------------------------------------------------- ZAP
       # `zap_spider_minutes` is a dispatch input and therefore attacker-influenced
@@ -197,44 +347,131 @@ jobs:
               -w zap-full.md \
               -I
 
-      # Authenticated pass — phase 1 could not test this class at all (its target
-      # had no seeded accounts), so it is the main new DAST capability of phase 2.
+      # -------------------------------- ZAP authenticated (Automation Framework)
+      # This REPLACES the cookie-injection pass used up to baseline B5, which
+      # produced a documented null result: it reached /dashboard and
+      # /allocations/2 and reported exactly the same 29 alert types as the
+      # unauthenticated scan. The leading explanation was that a scanner holding
+      # a static cookie will happily crawl /logout and invalidate its own
+      # session part-way through, after which every request is anonymous again.
       #
-      # Mechanism: a session cookie is obtained with curl above and injected into
-      # every ZAP request through ZAP's `replacer` add-on. This is the simplest
-      # reliable form of authenticated scanning with the packaged
-      # `zap-full-scan.py`, but it has a known limitation worth recording with
-      # the results: ZAP may crawl `/logout` and invalidate its own session
-      # part-way through, so coverage of the authenticated surface is
-      # best-effort. A ZAP Automation Framework plan with a proper
-      # authentication + session-management context (which re-authenticates on
-      # logout) is the stronger form and is an explicit next step, not something
-      # this step claims to already do.
-      - name: ZAP full scan (ACTIVE, authenticated as seeded user1)
+      # The Automation Framework plan addresses both halves of that:
+      #   * a real `context` with form-based `authentication`, cookie
+      #     `sessionManagement` and a named `user`, so ZAP owns the login rather
+      #     than being handed a cookie;
+      #   * `verification.method: poll` — ZAP re-requests /dashboard every 30
+      #     requests and RE-AUTHENTICATES whenever the logged-in regex is
+      #     absent, so losing the session is self-healing rather than terminal;
+      #   * `excludePaths` for /logout, so the session is not thrown away in the
+      #     first place.
+      # Spider, AJAX spider and active scan all run AS that user.
+      #
+      # The plan is written here rather than committed to the repository on
+      # purpose: adding a file containing the seeded passwords to the scanned
+      # tree would change what every secret scanner in the trial sees — the
+      # harness would be altering its own measurement.
+      - name: Write ZAP Automation Framework plan
         if: inputs.run_zap_authenticated && steps.auth.outputs.authenticated == 'true'
-        continue-on-error: true
         env:
-          SESSION_COOKIE: ${{ steps.auth.outputs.session_cookie }}
           ZAP_SPIDER_MINUTES: ${{ inputs.zap_spider_minutes }}
         run: |
+          cat > "$REPORT_DIR/zap-af-plan.yaml" <<PLAN
+          env:
+            contexts:
+              - name: "nodegoat"
+                urls:
+                  - "$TARGET_URL"
+                includePaths:
+                  - "$TARGET_URL.*"
+                excludePaths:
+                  - "$TARGET_URL/logout.*"
+                authentication:
+                  method: "form"
+                  parameters:
+                    loginPageUrl: "$TARGET_URL/login"
+                    loginRequestUrl: "$TARGET_URL/login"
+                    loginRequestBody: "userName={%username%}&password={%password%}"
+                  verification:
+                    method: "poll"
+                    loggedInRegex: 'logout-menu-link'
+                    loggedOutRegex: 'name="userName"'
+                    pollFrequency: 30
+                    pollUnits: "requests"
+                    pollUrl: "$TARGET_URL/dashboard"
+                    pollPostData: ""
+                sessionManagement:
+                  method: "cookie"
+                users:
+                  - name: "user1"
+                    credentials:
+                      username: "$DEMO_USER"
+                      password: "$DEMO_PASS"
+            parameters:
+              failOnError: false
+              failOnWarning: false
+              progressToStdout: true
+
+          jobs:
+            - type: "passiveScan-config"
+              parameters:
+                maxAlertsPerRule: 10
+                scanOnlyInScope: true
+            - type: "spider"
+              parameters:
+                context: "nodegoat"
+                user: "user1"
+                url: "$TARGET_URL"
+                maxDuration: $ZAP_SPIDER_MINUTES
+            - type: "spiderAjax"
+              parameters:
+                context: "nodegoat"
+                user: "user1"
+                url: "$TARGET_URL"
+                maxDuration: 3
+                browserId: "firefox-headless"
+            - type: "passiveScan-wait"
+              parameters:
+                maxDuration: 5
+            - type: "activeScan"
+              parameters:
+                context: "nodegoat"
+                user: "user1"
+                maxRuleDurationInMins: 2
+                maxScanDurationInMins: 20
+            - type: "report"
+              parameters:
+                template: "traditional-json"
+                reportDir: "/zap/wrk"
+                reportFile: "zap-af-authenticated"
+                reportTitle: "ZAP Automation Framework - authenticated as user1"
+            - type: "report"
+              parameters:
+                template: "traditional-html"
+                reportDir: "/zap/wrk"
+                reportFile: "zap-af-authenticated"
+                reportTitle: "ZAP Automation Framework - authenticated as user1"
+            - type: "report"
+              parameters:
+                template: "traditional-md"
+                reportDir: "/zap/wrk"
+                reportFile: "zap-af-authenticated"
+                reportTitle: "ZAP Automation Framework - authenticated as user1"
+          PLAN
+          echo "----- plan written to $REPORT_DIR/zap-af-plan.yaml -----"
+          # The plan carries the app's own published demo password, which is not
+          # a secret (artifacts/db-reset.js publishes all three), so printing it
+          # and uploading it as an artifact is deliberate.
+          cat "$REPORT_DIR/zap-af-plan.yaml"
+
+      - name: ZAP Automation Framework scan (ACTIVE, authenticated as seeded user1)
+        if: inputs.run_zap_authenticated && steps.auth.outputs.authenticated == 'true'
+        continue-on-error: true
+        run: |
           docker run --rm --network host \
-            -e SESSION_COOKIE \
             -v "${PWD}/${REPORT_DIR}:/zap/wrk:rw" \
             ghcr.io/zaproxy/zaproxy:stable \
-            zap-full-scan.py \
-              -t "$TARGET_URL" \
-              -m "$ZAP_SPIDER_MINUTES" \
-              -r zap-authenticated.html \
-              -J zap-authenticated.json \
-              -x zap-authenticated.xml \
-              -w zap-authenticated.md \
-              -I \
-              -z "-config replacer.full_list(0).description=auth-cookie \
-                  -config replacer.full_list(0).enabled=true \
-                  -config replacer.full_list(0).matchtype=REQ_HEADER \
-                  -config replacer.full_list(0).matchstr=Cookie \
-                  -config replacer.full_list(0).regex=false \
-                  -config replacer.full_list(0).replacement=${SESSION_COOKIE}"
+            zap.sh -cmd -autorun /zap/wrk/zap-af-plan.yaml \
+            2>&1 | tee "$REPORT_DIR/zap-af-run.log"
 
       - name: Note skipped authenticated scan
         if: inputs.run_zap_authenticated && steps.auth.outputs.authenticated != 'true'
@@ -306,6 +543,10 @@ jobs:
             echo "scanned SHA:  ${GITHUB_SHA}"
             echo "NODE_ENV:     ${NODE_ENV}"
             echo "authenticated pass ran: ${{ steps.auth.outputs.authenticated == 'true' && inputs.run_zap_authenticated }}"
+            echo "authenticated mechanism: ZAP Automation Framework (form auth, cookie session management, poll re-auth, /logout excluded)"
+            echo "access-control differential ran: ${{ steps.auth.outputs.authenticated == 'true' && inputs.run_access_control_diff }}"
+            echo "  ground-truth rows confirmed: ${{ steps.acdiff.outputs.confirmed }}"
+            echo "  failed controls:             ${{ steps.acdiff.outputs.failed_controls }}"
             echo ""
             echo "## scanner images (digest = the exact bits that ran)"
             for img in ghcr.io/zaproxy/zaproxy:stable projectdiscovery/nuclei:latest ghcr.io/sullo/nikto:latest; do
@@ -313,6 +554,13 @@ jobs:
                 || echo 'not pulled (tool disabled this run)')
               echo "$img -> $digest"
             done
+            echo ""
+            echo "## zap version"
+            if docker image inspect ghcr.io/zaproxy/zaproxy:stable >/dev/null 2>&1; then
+              docker run --rm ghcr.io/zaproxy/zaproxy:stable zap.sh -cmd -version 2>&1 | tail -3 || true
+            else
+              echo "n/a (zap disabled this run)"
+            fi
             echo ""
             echo "## nuclei version"
             if docker image inspect projectdiscovery/nuclei:latest >/dev/null 2>&1; then
@@ -348,7 +596,8 @@ jobs:
           }
           check "ZAP baseline"     "${{ inputs.run_zap_baseline }}" zap-baseline.json
           check "ZAP full scan"    "${{ inputs.run_zap_full }}"     zap-full.json
-          check "ZAP authenticated" "${{ inputs.run_zap_authenticated && steps.auth.outputs.authenticated == 'true' }}" zap-authenticated.json
+          check "ZAP authenticated (Automation Framework)" "${{ inputs.run_zap_authenticated && steps.auth.outputs.authenticated == 'true' }}" zap-af-authenticated.json
+          check "Access-control differential" "${{ inputs.run_access_control_diff && steps.auth.outputs.authenticated == 'true' }}" access-control-differential.json
           check "Nuclei"           "${{ inputs.run_nuclei }}"       nuclei.jsonl
           check "Nikto (HTML)"     "${{ inputs.run_nikto }}"        nikto.html
           check "Nikto (JSON)"     "${{ inputs.run_nikto }}"        nikto.json
@@ -362,12 +611,13 @@ jobs:
             echo ""
             echo "Repository:  \`${GITHUB_REPOSITORY}\` @ \`${GITHUB_SHA}\`"
             echo "Scanned URL (in-runner only): \`${TARGET_URL}\`"
-            echo "Authenticated pass: \`${{ steps.auth.outputs.authenticated == 'true' && inputs.run_zap_authenticated }}\`"
+            echo "Authenticated pass (Automation Framework): \`${{ steps.auth.outputs.authenticated == 'true' && inputs.run_zap_authenticated }}\`"
             echo ""
             echo "| report | size |"
             echo "|---|---|"
             shopt -s nullglob
             for f in "$REPORT_DIR"/*; do
+              [ -f "$f" ] || continue
               echo "| $(basename "$f") | $(stat -c%s "$f") bytes |"
             done
             if [ "${TOOLS_MISSING_REPORTS:-0}" != "0" ]; then

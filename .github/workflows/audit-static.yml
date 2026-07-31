@@ -456,11 +456,147 @@ jobs:
           path: snyk-oss.sarif
           if-no-files-found: warn
 
+  # Snyk IaC = infrastructure-as-code misconfiguration, the third product on the
+  # same SNYK_TOKEN. It exists in this trial as a SECOND OPINION on exactly one
+  # number: Trivy's `misconfig` scanner found a single issue (`DS-0026` on
+  # `Dockerfile`) across the two container files this repository carries, and one
+  # finding from one tool is not enough to say whether that is a clean tree or a
+  # thin scanner.
+  #
+  # Two passes on purpose. The first names `Dockerfile` and `docker-compose.yml`
+  # explicitly, because those are the files under comparison. The second scans
+  # the whole tree, so "found nothing" can be distinguished from "was never
+  # pointed at anything it understands" — Snyk IaC's supported formats are
+  # Terraform, CloudFormation, Kubernetes, ARM and Helm, and whether it reads
+  # container files at all is precisely what this job is here to establish.
+  # Both raw outputs are uploaded verbatim; a tool that refuses the input is a
+  # reportable result, not a failure to hide.
+  snyk-iac:
+    name: IaC - Snyk IaC
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: snyk/actions/setup@master
+
+      - name: Snyk IaC test (Dockerfile + docker-compose.yml)
+        continue-on-error: true
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        run: |
+          # `snyk iac test` exits non-zero both when it finds issues AND when it
+          # rejects the input, so the exit code is captured rather than allowed
+          # to abort the step — the distinction between those two cases is the
+          # measurement.
+          set +e
+          snyk iac test Dockerfile docker-compose.yml \
+            --sarif-file-output=snyk-iac.sarif > snyk-iac-files.txt 2>&1
+          rc=$?
+          set -e
+          echo "exit code: $rc" >> snyk-iac-files.txt
+          cat snyk-iac-files.txt
+
+      - name: Snyk IaC test (whole tree)
+        continue-on-error: true
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        run: |
+          set +e
+          snyk iac test . \
+            --sarif-file-output=snyk-iac-tree.sarif > snyk-iac-tree.txt 2>&1
+          rc=$?
+          set -e
+          echo "exit code: $rc" >> snyk-iac-tree.txt
+          cat snyk-iac-tree.txt
+
+      - name: Summarise Snyk IaC
+        if: always()
+        run: |
+          {
+            echo "## Snyk IaC"
+            echo ""
+            for pass in files tree; do
+              sarif="snyk-iac.sarif"
+              [ "$pass" = "tree" ] && sarif="snyk-iac-tree.sarif"
+              echo "### pass: $pass"
+              if [ -s "$sarif" ]; then
+                n=$(jq '[.runs[].results[]?] | length' "$sarif" 2>/dev/null || echo "parse error")
+                r=$(jq '.runs[0].tool.driver.rules | length' "$sarif" 2>/dev/null || echo "parse error")
+                echo "SARIF produced: **$n results / $r rules**"
+              else
+                echo "**no SARIF produced** - CLI output below is the result"
+              fi
+              echo ""
+              echo '```'
+              tail -40 "snyk-iac-$pass.txt" 2>/dev/null || echo "(no output captured)"
+              echo '```'
+              echo ""
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Record run-manifest fragment (Snyk IaC)
+        if: always()
+        run: |
+          {
+            echo "## snyk iac"
+            echo "cli version: $(snyk --version 2>/dev/null || echo 'n/a')"
+            echo "passes: 'Dockerfile docker-compose.yml' and whole tree ('.')"
+            echo "scanned HEAD: $(git rev-parse HEAD 2>/dev/null || echo 'n/a')"
+          } > manifest-snyk-iac.txt
+
+      - name: Upload run-manifest fragment
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: manifest-snyk-iac
+          path: manifest-snyk-iac.txt
+          if-no-files-found: warn
+
+      # Distinct `category:` is what lets tools coexist in the Security tab —
+      # without it each upload replaces the previous tool's results. Guarded on
+      # the file existing, because `upload-sarif` hard-fails on a missing file
+      # and the whole point of this job is that producing no SARIF is a possible
+      # (and reportable) outcome. The `Verify` step below is what makes that
+      # outcome visible instead of silent.
+      - name: Upload Snyk IaC SARIF to Security tab
+        if: always() && hashFiles('snyk-iac.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: snyk-iac.sarif
+          category: snyk-iac
+
+      - name: Upload Snyk IaC output as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sarif-snyk-iac
+          path: |
+            snyk-iac.sarif
+            snyk-iac-tree.sarif
+            snyk-iac-files.txt
+            snyk-iac-tree.txt
+          if-no-files-found: warn
+
+      - name: Verify Snyk IaC produced something readable
+        if: always()
+        run: |
+          if [ ! -s snyk-iac-files.txt ] && [ ! -s snyk-iac-tree.txt ]; then
+            echo "::error::Snyk IaC produced neither SARIF nor CLI output - the step failed silently; check its log"
+            exit 1
+          fi
+          if [ ! -s snyk-iac.sarif ] && [ ! -s snyk-iac-tree.sarif ]; then
+            echo "::warning::Snyk IaC produced no SARIF in either pass - see snyk-iac-files.txt / snyk-iac-tree.txt for the reason it gave"
+          fi
+
   # ------------------------------------------------------------- aggregation
   summary:
     name: Findings summary
     runs-on: ubuntu-latest
-    needs: [ semgrep, osv-scanner, trivy, npm-audit, snyk-code, snyk-oss ]
+    needs: [ semgrep, osv-scanner, trivy, npm-audit, snyk-code, snyk-oss, snyk-iac ]
     if: always()
     timeout-minutes: 10
     permissions: {}
