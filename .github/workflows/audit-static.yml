@@ -180,8 +180,16 @@ jobs:
           # distinguishable from "found nothing". The console output is teed to a
           # file because it is the only place the engine tier is stated, and
           # proving which engine ran is the point of the experiment.
+          #
+          # `--verbose` is on for that last reason alone. Neither the SARIF nor
+          # the default console output states whether INTERFILE (cross-file)
+          # analysis was active — the default banner reports only that the Pro
+          # binary was installed, which is also true when the organisation has
+          # cross-file switched off. Verbose output names the analysis mode, and
+          # an experiment whose entire question is "did cross-file run" cannot
+          # rely on an inference. It does not change which findings are reported.
           set +e
-          semgrep ci --sarif --output semgrep-pro.sarif 2>&1 | tee semgrep-pro-log.txt
+          semgrep ci --verbose --sarif --output semgrep-pro.sarif 2>&1 | tee semgrep-pro-log.txt
           rc=${PIPESTATUS[0]}
           set -e
           echo "semgrep ci exit code: $rc" | tee -a semgrep-pro-log.txt
