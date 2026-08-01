@@ -10,7 +10,9 @@ name: Code Audit (static + SCA)
 # and results can go to the Security tab, where GitHub's own code-scanning UI
 # becomes part of what is being evaluated.
 #
-# Tools: Semgrep, OSV-Scanner, Trivy (vuln + secret + misconfig, run twice —
+# Tools: Semgrep (twice — CE via the registry packs, and the hosted Free Edition
+# via `semgrep ci`, so the cross-file engine can be compared against the CE
+# baseline over the same tree), OSV-Scanner, Trivy (vuln + secret + misconfig, run twice —
 # once with defaults and once with dev dependencies included), Snyk Code, Snyk
 # Open Source, and `npm audit` as the zero-setup baseline (the npm analogue of
 # phase 1's `pnpm audit` — a reference point, not a ranked tool). CodeQL runs in
@@ -109,6 +111,173 @@ jobs:
         with:
           name: sarif-semgrep
           path: semgrep.sarif
+          if-no-files-found: warn
+
+  # ------------------------------------------ Semgrep hosted Free Edition
+  # EXPERIMENT — the planning repo's phase-2 selection doc, section 7 item 4.
+  #
+  # The `semgrep` job above runs Semgrep CE, of which the vendor says it "can
+  # only analyze interactions within a single function". Every CE figure in this
+  # trial is therefore an intraprocedural floor, and the four ground-truth rows
+  # nothing free has found (NoSQL injection, log injection, session fixation,
+  # SSRF) all need untrusted input tracked ACROSS functions and files. The
+  # hosted Free Edition (up to 10 contributors) is documented to include that
+  # cross-file analysis at no cost, which — with CodeQL licence-barred from
+  # private client code — makes it the only known free route to the capability.
+  # Reaching it needs a login: `semgrep ci` with SEMGREP_APP_TOKEN, plus the
+  # cross-file toggle enabled in the semgrep.dev organisation settings.
+  #
+  # This is a SEPARATE job on purpose. The CE job above is the trial's baseline
+  # and its configuration must stay untouched, so both tiers scan the same tree
+  # in the same run and the engine is the variable under test.
+  #
+  # Two differences are accepted and must be REPORTED rather than hidden:
+  #   1. `semgrep ci` takes its rules from the organisation's policy on
+  #      semgrep.dev, not from the six `--config p/...` packs the CE job pins.
+  #      The rule set is therefore a second moving variable, and any delta is
+  #      "hosted tier as configured" rather than "engine alone".
+  #   2. Unlike every other job here, this one talks to a vendor backend:
+  #      findings and repository metadata leave, source does not.
+  #
+  # It runs on the host runner, not as `docker run` like the CE job: `semgrep
+  # ci` shells out to git for repository metadata and reads the GITHUB_*
+  # environment to identify the project. Both work natively on the runner, while
+  # inside the container the bind-mounted workspace is owned by the runner user
+  # and root's git trips its dubious-ownership check.
+  semgrep-pro:
+    name: SAST - Semgrep hosted (cross-file)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      # Full history: `semgrep ci` inspects git to decide whether a scan is full
+      # or diff-aware and to label the scan on semgrep.dev. A depth-1 checkout
+      # makes it guess.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Semgrep
+        run: |
+          python -m pip install --upgrade pip
+          pip install semgrep
+          semgrep --version
+
+      - name: Semgrep hosted scan
+        continue-on-error: true
+        env:
+          SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+        run: |
+          # `semgrep ci` exits 1 when it has findings and 2 on error, so the exit
+          # code is captured rather than allowed to abort the step: a scan with
+          # findings must still upload its SARIF, and "errored" has to stay
+          # distinguishable from "found nothing". The console output is teed to a
+          # file because it is the only place the engine tier is stated, and
+          # proving which engine ran is the point of the experiment.
+          set +e
+          semgrep ci --sarif --output semgrep-pro.sarif 2>&1 | tee semgrep-pro-log.txt
+          rc=${PIPESTATUS[0]}
+          set -e
+          echo "semgrep ci exit code: $rc" | tee -a semgrep-pro-log.txt
+
+      # The scan step cannot fail, so without this the job would report success
+      # whether Semgrep scanned the tree, refused the token, or never ran at all.
+      # Same discipline as the Snyk IaC job: absence of findings and absence of a
+      # scan must not look alike.
+      - name: Verify the scan produced SARIF
+        if: always()
+        run: |
+          if [ ! -s semgrep-pro-log.txt ]; then
+            echo "::error::semgrep ci produced no console output at all - the step failed silently; check its log"
+            exit 1
+          fi
+          if [ ! -s semgrep-pro.sarif ]; then
+            echo "::error::semgrep-pro.sarif is missing or empty - semgrep ci did not complete a scan; the console output is in the semgrep-pro artifact"
+            exit 1
+          fi
+          rules=$(jq '.runs[0].tool.driver.rules | length' semgrep-pro.sarif 2>/dev/null || echo 0)
+          if [ "${rules:-0}" -eq 0 ]; then
+            echo "::error::semgrep-pro.sarif carries zero rules - the hosted policy resolved to an empty rule set"
+            exit 1
+          fi
+
+      # Which engine actually ran is the entire experiment, and it is not visible
+      # in the finding count: an intrafile scan and a cross-file scan both return
+      # a plausible-looking SARIF. The evidence is in the console banner and in
+      # whether any dataflow trace crosses a file boundary, so both are extracted
+      # here and put in the job summary. This step never fails the job - a
+      # negative answer is a result.
+      - name: Report the engine tier
+        if: always()
+        run: |
+          {
+            echo "## Semgrep hosted tier - engine evidence"
+            echo ""
+            echo "### Console lines mentioning the engine"
+            echo '```'
+            grep -i -E 'pro engine|interfile|cross-file|cross file|interprocedural|cross-function|deep|analysis *:|engine' \
+              semgrep-pro-log.txt | head -40 || echo "(no engine-related line found)"
+            echo '```'
+            echo ""
+            if [ -s semgrep-pro.sarif ]; then
+              n=$(jq '[.runs[].results[]?] | length' semgrep-pro.sarif 2>/dev/null || echo "parse error")
+              r=$(jq '.runs[0].tool.driver.rules | length' semgrep-pro.sarif 2>/dev/null || echo "parse error")
+              d=$(jq -r '.runs[0].tool.driver.name + " " + (.runs[0].tool.driver.semanticVersion // "?")' semgrep-pro.sarif 2>/dev/null || echo "parse error")
+              echo "SARIF: **$n results / $r rules**, driver \`$d\`"
+              echo ""
+              # A dataflow trace whose locations span more than one file is direct
+              # proof of interfile analysis, independent of anything the banner says.
+              x=$(jq '[.runs[].results[]? | select((.codeFlows // []) | length > 0)
+                       | [.codeFlows[].threadFlows[].locations[].location.physicalLocation.artifactLocation.uri]
+                       | unique | length] | map(select(. > 1)) | length' \
+                    semgrep-pro.sarif 2>/dev/null || echo "parse error")
+              echo "Findings whose dataflow trace spans more than one file: **$x**"
+            else
+              echo "**No SARIF produced.**"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Record run-manifest fragment (Semgrep hosted)
+        if: always()
+        run: |
+          {
+            echo "## semgrep hosted (cross-file)"
+            echo "version: $(semgrep --version 2>/dev/null || echo 'n/a')"
+            echo "invocation: semgrep ci (rules from the semgrep.dev org policy, not from --config)"
+            echo "scanned HEAD: $(git rev-parse HEAD 2>/dev/null || echo 'n/a')"
+          } > manifest-semgrep-pro.txt
+
+      - name: Upload run-manifest fragment
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: manifest-semgrep-pro
+          path: manifest-semgrep-pro.txt
+          if-no-files-found: warn
+
+      # Distinct category so this does not overwrite the CE job's results; the
+      # two tiers must sit side by side in the Security tab.
+      - name: Upload Semgrep hosted SARIF to Security tab
+        if: always() && hashFiles('semgrep-pro.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: semgrep-pro.sarif
+          category: semgrep-pro
+
+      - name: Upload Semgrep hosted output as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sarif-semgrep-pro
+          path: |
+            semgrep-pro.sarif
+            semgrep-pro-log.txt
           if-no-files-found: warn
 
   # ---------------------------------------------------------------- SCA
@@ -596,7 +765,7 @@ jobs:
   summary:
     name: Findings summary
     runs-on: ubuntu-latest
-    needs: [ semgrep, osv-scanner, trivy, npm-audit, snyk-code, snyk-oss, snyk-iac ]
+    needs: [ semgrep, semgrep-pro, osv-scanner, trivy, npm-audit, snyk-code, snyk-oss, snyk-iac ]
     if: always()
     timeout-minutes: 10
     permissions: {}
@@ -647,6 +816,7 @@ jobs:
             fi
           }
           check semgrep.sarif
+          check semgrep-pro.sarif
           check osv.sarif
           check trivy.sarif
           check trivy-devdeps.sarif
