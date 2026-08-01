@@ -194,6 +194,67 @@ jobs:
           set -e
           echo "semgrep ci exit code: $rc" | tee -a semgrep-pro-log.txt
 
+      # CONTROL PASS — the only reliable way to establish the analysis mode.
+      #
+      # Neither the SARIF nor the console output, even at --verbose, ever names
+      # the mode: the banner reports that the Pro binary was installed, which is
+      # equally true when the organisation has cross-file analysis switched off.
+      # So the mode is established behaviourally instead. `--pro` forces
+      # interfile analysis on regardless of the organisation setting; if this
+      # pass returns the same findings as the default pass above, the setting
+      # was already in effect, and if it returns more, it was not. A tier
+      # comparison that cannot say which tier ran measures nothing, which is why
+      # this pass is worth its runtime.
+      #
+      # A refusal is also an answer — if `--pro` is gated behind a paid plan the
+      # CLI says so, and that output is captured rather than swallowed.
+      - name: Semgrep hosted scan - forced cross-file control
+        continue-on-error: true
+        env:
+          SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+        run: |
+          set +e
+          semgrep ci --pro --sarif --output semgrep-pro-forced.sarif 2>&1 \
+            | tee semgrep-pro-forced-log.txt
+          rc=${PIPESTATUS[0]}
+          set -e
+          echo "semgrep ci --pro exit code: $rc" | tee -a semgrep-pro-forced-log.txt
+
+      - name: Compare the default pass against the forced cross-file pass
+        if: always()
+        run: |
+          {
+            echo "## Default pass vs forced cross-file pass"
+            echo ""
+            for f in semgrep-pro.sarif semgrep-pro-forced.sarif; do
+              if [ -s "$f" ]; then
+                n=$(jq '[.runs[].results[]?] | length' "$f" 2>/dev/null || echo "?")
+                a=$(jq '[.runs[].results[] | select((.locations[0].physicalLocation.artifactLocation.uri | startswith(".github/")) | not)] | length' "$f" 2>/dev/null || echo "?")
+                x=$(jq '[.runs[].results[]? | select((.codeFlows // []) | length > 0)
+                         | [.codeFlows[].threadFlows[].locations[].location.physicalLocation.artifactLocation.uri]
+                         | unique | length] | map(select(. > 1)) | length' "$f" 2>/dev/null || echo "?")
+                echo "- \`$f\`: **$n** whole-tree / **$a** application-only / **$x** findings with a dataflow trace spanning more than one file"
+              else
+                echo "- \`$f\`: **not produced** - see its log in the artifact"
+              fi
+            done
+            echo ""
+            if [ -s semgrep-pro.sarif ] && [ -s semgrep-pro-forced.sarif ]; then
+              jq -S '[.runs[].results[] | {r: .ruleId, u: .locations[0].physicalLocation.artifactLocation.uri, l: .locations[0].physicalLocation.region.startLine}] | sort' \
+                 semgrep-pro.sarif > /tmp/a.json
+              jq -S '[.runs[].results[] | {r: .ruleId, u: .locations[0].physicalLocation.artifactLocation.uri, l: .locations[0].physicalLocation.region.startLine}] | sort' \
+                 semgrep-pro-forced.sarif > /tmp/b.json
+              if diff -q /tmp/a.json /tmp/b.json >/dev/null; then
+                echo "**Finding sets are identical** - forcing cross-file analysis changed nothing, so the organisation setting was already in effect."
+              else
+                echo "**Finding sets differ** - the default pass was NOT running with cross-file analysis. Diff:"
+                echo '```'
+                diff /tmp/a.json /tmp/b.json | head -60
+                echo '```'
+              fi
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
       # The scan step cannot fail, so without this the job would report success
       # whether Semgrep scanned the tree, refused the token, or never ran at all.
       # Same discipline as the Snyk IaC job: absence of findings and absence of a
@@ -286,6 +347,8 @@ jobs:
           path: |
             semgrep-pro.sarif
             semgrep-pro-log.txt
+            semgrep-pro-forced.sarif
+            semgrep-pro-forced-log.txt
           if-no-files-found: warn
 
   # ---------------------------------------------------------------- SCA
