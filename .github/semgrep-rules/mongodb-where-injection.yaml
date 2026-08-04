@@ -1,0 +1,113 @@
+rules:
+  # --------------------------------------------------------------- Rule A
+  # Sink-only pattern rule. No dataflow: it asserts nothing about where the
+  # interpolated value came from, only that a MongoDB `$where` expression is
+  # being ASSEMBLED at runtime rather than written as a constant.
+  #
+  # `$where` is not a query operator in the ordinary sense - the server hands
+  # the string to a JavaScript interpreter and runs it once per candidate
+  # document. So a `$where` string built by concatenation or template
+  # interpolation is a code-construction site, and the correct question about it
+  # is the one asked of `eval`, not the one asked of a WHERE clause.
+  #
+  # Deliberately narrow: `{ $where: someVariable }` is NOT reported. Only an
+  # explicit concatenation or an interpolating template literal counts, because
+  # those are the forms that provably mix data into code text at this line.
+  - id: mongodb-where-dynamic-server-side-js
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: >-
+      MongoDB `$where` expression built at runtime by string interpolation or
+      concatenation. The `$where` value is sent to the database server and
+      evaluated as JavaScript against every candidate document, so anything
+      spliced into it is executed as code, not compared as data. If any part of
+      this expression can be influenced by a request, this is server-side
+      JavaScript injection (and a denial-of-service primitive - `while(true){}`
+      is a valid payload). Replace `$where` with ordinary query operators
+      (`$expr`, `$gt`, `$eq`), or validate and coerce every interpolated value to
+      a number or a strict allow-list before it reaches the string.
+    metadata:
+      category: security
+      cwe:
+        - "CWE-943: Improper Neutralization of Special Elements in Data Query Logic"
+        - "CWE-94: Improper Control of Generation of Code ('Code Injection')"
+      owasp:
+        - "A03:2021 - Injection"
+        - "A01:2017 - Injection"
+      technology: [mongodb, javascript, express]
+      confidence: HIGH
+      likelihood: MEDIUM
+      impact: HIGH
+      subcategory: [vuln]
+      references:
+        - https://www.mongodb.com/docs/manual/reference/operator/query/where/
+        - https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/07-Input_Validation_Testing/05.6-Testing_for_NoSQL_Injection
+    patterns:
+      - pattern-either:
+          - pattern: "{..., $where: $EXPR, ...}"
+          - pattern: '{..., "$where": $EXPR, ...}'
+      - metavariable-pattern:
+          metavariable: $EXPR
+          patterns:
+            - pattern-either:
+                # string concatenation, either direction
+                - pattern: $A + $B
+                # template literal carrying at least one substitution
+                - pattern: "`...${...}...`"
+
+  # --------------------------------------------------------------- Rule B
+  # Same sink, but the premise is inverted: instead of asking "does this line
+  # look like assembly", it asks "can request data get here at all", and lets
+  # the engine answer across function and file boundaries.
+  #
+  # `options.interfile: true` requires the Pro engine (`semgrep --pro`). Under
+  # the OSS engine this rule is still syntactically valid and still runs - it
+  # simply degrades to intra-file, intra-function taint, which on a typical
+  # layered application means it finds nothing, because the route handler that
+  # reads the request and the data-access function that builds the query are
+  # different files by construction.
+  - id: mongodb-where-tainted-server-side-js
+    languages: [javascript, typescript]
+    severity: ERROR
+    mode: taint
+    options:
+      interfile: true
+    message: >-
+      Request-controlled data reaches a MongoDB `$where` expression. `$where` is
+      evaluated as JavaScript on the database server, so this is not query
+      manipulation - it is remote code execution in the database process,
+      bounded only by what the evaluator exposes. `1'; return 1 == '1` returns
+      every document; `0';while(true){}'` hangs the server. Do not sanitize the
+      string: remove `$where` in favour of ordinary query operators, or coerce
+      the value to a number / strict allow-list before it is ever interpolated.
+    metadata:
+      category: security
+      cwe:
+        - "CWE-943: Improper Neutralization of Special Elements in Data Query Logic"
+        - "CWE-94: Improper Control of Generation of Code ('Code Injection')"
+      owasp:
+        - "A03:2021 - Injection"
+        - "A01:2017 - Injection"
+      technology: [mongodb, javascript, express]
+      confidence: HIGH
+      likelihood: HIGH
+      impact: HIGH
+      subcategory: [vuln]
+      references:
+        - https://www.mongodb.com/docs/manual/reference/operator/query/where/
+    pattern-sources:
+      # Express / Koa / Fastify request surfaces. No naming assumption is made
+      # about the request object itself - the property names are the marker, and
+      # the narrowness of the sink is what keeps that affordable.
+      - pattern-either:
+          - pattern: $REQ.query
+          - pattern: $REQ.params
+          - pattern: $REQ.body
+          - pattern: $REQ.cookies
+          - pattern: $REQ.headers
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - pattern: "{..., $where: $EXPR, ...}"
+              - pattern: '{..., "$where": $EXPR, ...}'
+          - focus-metavariable: $EXPR

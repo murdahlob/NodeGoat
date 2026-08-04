@@ -351,6 +351,237 @@ jobs:
             semgrep-pro-forced-log.txt
           if-no-files-found: warn
 
+  # ----------------------------------------------- Semgrep custom rules (B8)
+  # EXPERIMENT — the successor to the hosted-tier run above. That run settled
+  # that Semgrep's cross-file taint engine was ACTIVE and still reported nothing
+  # on the NoSQL `$where` row: a rule-coverage gap, not an engine gap. The
+  # commercial consequence is large — a rule gap is closed by writing one rule,
+  # an engine gap is not closed at any price — so it is worth one experiment to
+  # find out which it really is.
+  #
+  # What is being measured is NOT "can Semgrep find this defect" (a rule naming
+  # the file would trivially succeed and prove nothing). It is:
+  #   1. does a GENERIC rule for the class close the row, and
+  #   2. what does authoring it cost, and
+  #   3. how much noise does it produce over the rest of the tree.
+  # The rules therefore contain no identifier from this application: no field
+  # name, no file path, no function name. They describe "user-controllable data
+  # reaches a MongoDB `$where`", which is a defect class, not a location.
+  #
+  # Two variants of the same sink, run as two separate steps producing two
+  # separate SARIF files, because the whole question is which TIER is required:
+  #   Rule A — sink-only pattern, no dataflow. Runs on the OSS engine with no
+  #            account. If this suffices, the paid/hosted dataflow tier buys
+  #            nothing for this row.
+  #   Rule B — `mode: taint` with `interfile: true`, sources = Express request
+  #            surfaces. Needs the Pro engine, i.e. the same SEMGREP_APP_TOKEN
+  #            the job above uses.
+  # Both rules live in one file (.github/semgrep-rules/) and both steps load the
+  # whole directory; the rule IDs are what separate the variants in the output.
+  #
+  # This job does not touch the `semgrep` or `semgrep-pro` jobs above. Their
+  # configuration is the trial's baseline and must stay frozen, so the custom
+  # rules are strictly additive and their findings are never mixed into either
+  # baseline count.
+  semgrep-custom:
+    name: SAST - Semgrep custom rules (NoSQL $where)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ------------------------------------------------ variant A: OSS engine
+      # Deliberately the plain `semgrep scan` shape, in the container, with no
+      # token in the environment: this step must be reproducible by anyone with
+      # Docker and no Semgrep account, because "does the free tier suffice" is
+      # half the question. Exit 1 means findings, so the code is captured rather
+      # than allowed to abort the step and skip the upload.
+      - name: Semgrep custom rules - OSS engine (Rule A)
+        continue-on-error: true
+        run: |
+          set +e
+          docker run --rm --user 0 \
+            -v "${PWD}:/src" -w /src \
+            semgrep/semgrep \
+            semgrep scan \
+              --config /src/.github/semgrep-rules/ \
+              --metrics off \
+              --sarif --output /src/semgrep-custom-ce.sarif \
+            2>&1 | tee semgrep-custom-ce-log.txt
+          rc=${PIPESTATUS[0]}
+          set -e
+          echo "semgrep scan (OSS) exit code: $rc" | tee -a semgrep-custom-ce-log.txt
+
+      # ------------------------------------------------- variant B: Pro engine
+      # `--pro` is what turns `options.interfile: true` from a no-op into
+      # cross-file taint propagation. It needs the token, and `--config` is what
+      # keeps the organisation policy OUT of this run: the point is to measure
+      # the custom rules alone, so a run polluted with 2,900 policy rules would
+      # answer a different question. If `scan --pro --config` is refused under a
+      # CI token, the fallback below runs `semgrep ci` with the same `--config`
+      # override; whichever produced the SARIF is recorded in the log.
+      - name: Semgrep custom rules - Pro engine (Rule B)
+        continue-on-error: true
+        env:
+          SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+        run: |
+          python3 -m pip install --quiet --upgrade pip
+          pip install --quiet semgrep
+          semgrep --version | tee semgrep-custom-pro-log.txt
+
+          echo "=== attempt 1: semgrep scan --pro --config ===" | tee -a semgrep-custom-pro-log.txt
+          set +e
+          semgrep scan --pro \
+            --config .github/semgrep-rules/ \
+            --metrics off \
+            --sarif --output semgrep-custom-pro.sarif \
+            2>&1 | tee -a semgrep-custom-pro-log.txt
+          rc=${PIPESTATUS[0]}
+          set -e
+          echo "semgrep scan --pro exit code: $rc" | tee -a semgrep-custom-pro-log.txt
+
+          # A refusal is a result, not a failure to hide - but it must not end
+          # the experiment, so the documented alternative invocation is tried.
+          if [ ! -s semgrep-custom-pro.sarif ]; then
+            echo "=== attempt 1 produced no SARIF; attempt 2: semgrep ci --config ===" \
+              | tee -a semgrep-custom-pro-log.txt
+            set +e
+            semgrep ci --config .github/semgrep-rules/ \
+              --sarif --output semgrep-custom-pro.sarif \
+              2>&1 | tee -a semgrep-custom-pro-log.txt
+            rc=${PIPESTATUS[0]}
+            set -e
+            echo "semgrep ci --config exit code: $rc" | tee -a semgrep-custom-pro-log.txt
+            echo "WORKING INVOCATION: semgrep ci --config" | tee -a semgrep-custom-pro-log.txt
+          else
+            echo "WORKING INVOCATION: semgrep scan --pro --config" | tee -a semgrep-custom-pro-log.txt
+          fi
+
+      # The experiment's actual readout, in the job summary so it survives even
+      # if the artifacts are never downloaded. Reports per variant: how many
+      # findings, where, and - for the taint variant - whether any dataflow
+      # trace crosses a file boundary, which is the only direct evidence that
+      # interfile analysis did anything.
+      - name: Report what each variant found
+        if: always()
+        run: |
+          {
+            echo "## Semgrep custom rules - \$where / NoSQL injection"
+            echo ""
+            for f in semgrep-custom-ce.sarif semgrep-custom-pro.sarif; do
+              echo "### \`$f\`"
+              if [ -s "$f" ]; then
+                n=$(jq '[.runs[].results[]?] | length' "$f" 2>/dev/null || echo "?")
+                r=$(jq '.runs[0].tool.driver.rules | length' "$f" 2>/dev/null || echo "?")
+                d=$(jq -r '.runs[0].tool.driver.name + " " + (.runs[0].tool.driver.semanticVersion // "?")' "$f" 2>/dev/null || echo "?")
+                echo "**$n results / $r rules**, driver \`$d\`"
+                echo ""
+                echo '```'
+                jq -r '.runs[].results[]? |
+                       (.ruleId // "?") + "  " +
+                       (.locations[0].physicalLocation.artifactLocation.uri // "?") + ":" +
+                       ((.locations[0].physicalLocation.region.startLine // 0) | tostring) + "-" +
+                       ((.locations[0].physicalLocation.region.endLine // 0) | tostring)' \
+                   "$f" 2>/dev/null || echo "(could not parse)"
+                echo '```'
+                x=$(jq '[.runs[].results[]? | select((.codeFlows // []) | length > 0)
+                         | [.codeFlows[].threadFlows[].locations[].location.physicalLocation.artifactLocation.uri]
+                         | unique | length] | map(select(. > 1)) | length' "$f" 2>/dev/null || echo "?")
+                echo ""
+                echo "Findings whose dataflow trace spans more than one file: **$x**"
+              else
+                echo "**not produced** - see the log in the artifact"
+              fi
+              echo ""
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Record run-manifest fragment (Semgrep custom)
+        if: always()
+        run: |
+          {
+            echo "## semgrep custom rules"
+            echo "rules:   .github/semgrep-rules/ ($(ls .github/semgrep-rules/ | tr '\n' ' '))"
+            echo "variant A: docker semgrep/semgrep, semgrep scan --config (OSS engine, no token)"
+            echo "variant B: $(grep -o 'WORKING INVOCATION: .*' semgrep-custom-pro-log.txt 2>/dev/null || echo 'no invocation succeeded')"
+            echo "pro cli version: $(semgrep --version 2>/dev/null || echo 'n/a')"
+            echo "scanned HEAD: $(git rev-parse HEAD 2>/dev/null || echo 'n/a')"
+          } > manifest-semgrep-custom.txt
+
+      - name: Upload run-manifest fragment
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: manifest-semgrep-custom
+          path: manifest-semgrep-custom.txt
+          if-no-files-found: warn
+
+      # Separate artifacts, not one bundle: the two variants answer different
+      # questions and must stay distinguishable after download.
+      - name: Upload custom-rule OSS output as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sarif-semgrep-custom-ce
+          path: |
+            semgrep-custom-ce.sarif
+            semgrep-custom-ce-log.txt
+          if-no-files-found: warn
+
+      - name: Upload custom-rule Pro output as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sarif-semgrep-custom-pro
+          path: |
+            semgrep-custom-pro.sarif
+            semgrep-custom-pro-log.txt
+          if-no-files-found: warn
+
+      # Distinct category so the custom rules never overwrite - or get counted
+      # into - either baseline Semgrep job's Security-tab results.
+      - name: Upload custom-rule OSS SARIF to Security tab
+        if: always() && hashFiles('semgrep-custom-ce.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: semgrep-custom-ce.sarif
+          category: semgrep-custom-ce
+
+      - name: Upload custom-rule Pro SARIF to Security tab
+        if: always() && hashFiles('semgrep-custom-pro.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: semgrep-custom-pro.sarif
+          category: semgrep-custom-pro
+
+      # Both scan steps are continue-on-error, so without this the job reports
+      # success whether the rules ran and found nothing or never loaded at all.
+      # "Found nothing" is a legitimate - and for this experiment, a very
+      # interesting - outcome; "never ran" is a broken measurement. They must not
+      # look alike. Runs last so the uploads above always happen first.
+      - name: Verify both variants produced SARIF
+        if: always()
+        run: |
+          fail=0
+          for f in semgrep-custom-ce.sarif semgrep-custom-pro.sarif; do
+            if [ ! -s "$f" ]; then
+              echo "::error::$f is missing or empty - that variant never completed a scan; its log is in the artifacts"
+              fail=1
+              continue
+            fi
+            rules=$(jq '.runs[0].tool.driver.rules | length' "$f" 2>/dev/null || echo 0)
+            if [ "${rules:-0}" -eq 0 ]; then
+              echo "::error::$f carries zero rules - the custom rule file did not load"
+              fail=1
+            fi
+          done
+          exit "$fail"
+
   # ---------------------------------------------------------------- SCA
   osv-scanner:
     name: SCA - OSV-Scanner
@@ -836,7 +1067,7 @@ jobs:
   summary:
     name: Findings summary
     runs-on: ubuntu-latest
-    needs: [ semgrep, semgrep-pro, osv-scanner, trivy, npm-audit, snyk-code, snyk-oss, snyk-iac ]
+    needs: [ semgrep, semgrep-pro, semgrep-custom, osv-scanner, trivy, npm-audit, snyk-code, snyk-oss, snyk-iac ]
     if: always()
     timeout-minutes: 10
     permissions: {}
@@ -888,6 +1119,10 @@ jobs:
           }
           check semgrep.sarif
           check semgrep-pro.sarif
+          # The B8 custom-rule variants. Zero FINDINGS from either is a valid
+          # experimental outcome; zero RULES, or no file at all, is a broken run.
+          check semgrep-custom-ce.sarif
+          check semgrep-custom-pro.sarif
           check osv.sarif
           check trivy.sarif
           check trivy-devdeps.sarif
