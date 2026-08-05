@@ -1,0 +1,38 @@
+{
+  // knip configuration for the phase-2 maintainability audit. Lives under
+  // .github/ (the scanning harness) so the application tree stays byte-identical
+  // to the pinned commit. NodeGoat is a non-standard CommonJS app: server.js is
+  // the runtime entry point and uses require(), not ES modules. Without an
+  // explicit entry/project config knip would analyze nothing useful, so the
+  // graph roots are declared here. Globs are relative to the repo root (knip's
+  // cwd), not to this file. See PLAN-003 and phase-2-tool-selection.md 4.5(a).
+  "$schema": "https://unpkg.com/knip@5/schema.json",
+  "entry": [
+    "server.js",
+    "Gruntfile.js",
+    "artifacts/db-reset.js",
+    "test/e2e/**/*.js",
+    "test/security/**/*.js",
+    "cypress.json"
+  ],
+  "project": [
+    "app/**/*.js",
+    "config/**/*.js",
+    "server.js",
+    "Gruntfile.js",
+    "artifacts/**/*.js"
+  ],
+  "ignore": [
+    "app/assets/vendor/**",
+    "app/views/**"
+  ],
+  "ignoreBinaries": [
+    "grunt",
+    "cypress",
+    "forever",
+    "docker",
+    "docker-compose",
+    "mongod"
+  ],
+  "ignoreDependencies": []
+}

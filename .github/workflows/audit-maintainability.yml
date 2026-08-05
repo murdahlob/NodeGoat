@@ -1,0 +1,312 @@
+name: Code Audit (maintainability / design)
+
+# PHASE-2 MAINTAINABILITY WORKFLOW — see the planning repo's PLAN-003
+# (bugs/design ground truth) and phase-2-tool-selection.md section 4.5(a),
+# which names three free, tier-A design instruments to score against that
+# ground truth:
+#
+#   * jscpd               — copy/paste (duplication) detection
+#   * knip                — dead code, unused exports, unused/unlisted deps
+#   * dependency-cruiser  — module graph: cycles, orphans, forbidden direction
+#
+# SonarQube Community (the fourth instrument) already runs in
+# sonarqube-community.yml; it is scored from that workflow's drained output.
+#
+# Like the other phase-2 scanners these run self-checkout against this fork's
+# own tree (the code under test is hosted here). They are plain npm packages run
+# through npx — no account, no token. Output is JSON (mechanically scoreable),
+# uploaded both to the step summary and as run artifacts. Each job VERIFIES its
+# output file exists and parses, so a tool that ran-and-found-nothing is
+# distinguishable from one that never ran (the ADR-007 Nikto lesson).
+#
+# Nothing here installs or executes the application. knip optionally reads an
+# installed node_modules for higher-accuracy dependency resolution; that install
+# is best-effort and continue-on-error, and knip runs either way — a failed
+# install is a recorded caveat, not a failed job.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ master ]
+    paths-ignore:
+      - '**.md'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: audit-maintainability-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ------------------------------------------------------------- duplication
+  jscpd:
+    name: Design - jscpd (duplication)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # Scope: application source only. The paths are passed explicitly rather
+      # than scanning `.` so the 750 KB of vendored bootstrap/jQuery/Morris under
+      # app/assets/vendor never enter the token stream. .jscpd.json carries the
+      # threshold (min-tokens 50, the tool default) and the ignore list.
+      - name: jscpd scan
+        continue-on-error: true
+        run: |
+          npx --yes jscpd@4 \
+            app/data app/routes app/views app/assets/js server.js config Gruntfile.js artifacts \
+            --config .github/maintainability/.jscpd.json \
+            --reporters json,markdown,console \
+            --output jscpd-report \
+            --mode mild || true
+          echo "--- output dir ---"
+          ls -la jscpd-report || true
+
+      - name: Verify jscpd produced a parseable report
+        if: always()
+        run: |
+          f=jscpd-report/jscpd-report.json
+          if [ ! -s "$f" ]; then
+            echo "::error::$f is missing or empty - jscpd did not produce a report (it did not run, or analyzed zero files)"
+            exit 1
+          fi
+          # A valid report has a .statistics.total.sources count; zero sources is a null result to report, not a pass.
+          sources=$(jq -r '.statistics.total.sources // 0' "$f")
+          clones=$(jq -r '(.duplicates | length) // 0' "$f")
+          echo "jscpd analyzed $sources source files and found $clones clone pair(s)"
+          if [ "$sources" -eq 0 ]; then
+            echo "::error::jscpd analyzed 0 files - config is wrong, this is a null result not a 0-finding run"
+            exit 1
+          fi
+
+      - name: Summarise jscpd
+        if: always()
+        run: |
+          f=jscpd-report/jscpd-report.json
+          {
+            echo "## jscpd (duplication)"
+            echo ""
+            echo "- sources analyzed: **$(jq -r '.statistics.total.sources // 0' "$f")**"
+            echo "- clone pairs: **$(jq -r '(.duplicates | length) // 0' "$f")**"
+            echo "- duplicated lines: **$(jq -r '.statistics.total.duplicatedLines // 0' "$f")** / $(jq -r '.statistics.total.lines // 0' "$f") ($(jq -r '.statistics.total.percentage // 0' "$f")%)"
+            echo ""
+            echo "### Clone pairs (firstFile -> secondFile, lines)"
+            echo ""
+            echo "| format | first | second | lines | tokens |"
+            echo "|---|---|---|---|---|"
+            jq -r '.duplicates[]? | "| \(.format) | \(.firstFile.name):\(.firstFile.start)-\(.firstFile.end) | \(.secondFile.name):\(.secondFile.start)-\(.secondFile.end) | \(.lines) | \(.tokens) |"' "$f" 2>/dev/null || echo "| (none) | | | | |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Record run-manifest fragment (jscpd)
+        if: always()
+        run: |
+          {
+            echo "## jscpd"
+            echo "version: $(npx --yes jscpd@4 --version 2>/dev/null || echo 'n/a')"
+            echo "scanned HEAD: $(git rev-parse HEAD 2>/dev/null || echo 'n/a')"
+          } > jscpd-report/manifest-jscpd.txt
+
+      - name: Upload jscpd report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: maintainability-jscpd
+          path: jscpd-report/
+          if-no-files-found: error
+
+  # --------------------------------------------------------------- dead code
+  knip:
+    name: Design - knip (dead code / unused deps)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # knip resolves imports more accurately with an installed node_modules,
+      # but NodeGoat's lockfile is from a much older Node era and may not install
+      # on a modern runner. The install is therefore best-effort: if it fails,
+      # knip still runs (against source + package.json only) and the reduced
+      # accuracy is a recorded caveat. `--ignore-scripts` keeps native/postinstall
+      # build steps out of the way; nothing here boots the app.
+      - name: Install dependencies (best-effort, for knip resolution)
+        id: install
+        continue-on-error: true
+        run: |
+          npm ci --ignore-scripts --no-audit --no-fund 2>&1 | tail -20 || \
+          npm install --ignore-scripts --no-audit --no-fund --legacy-peer-deps 2>&1 | tail -20
+          echo "node_modules present: $([ -d node_modules ] && echo yes || echo no)"
+
+      - name: Record whether install succeeded
+        if: always()
+        run: |
+          if [ -d node_modules ]; then
+            echo "KNIP_INSTALL=yes" >> "$GITHUB_ENV"
+          else
+            echo "KNIP_INSTALL=no" >> "$GITHUB_ENV"
+            echo "::warning::npm install did not produce node_modules; knip runs with reduced dependency-resolution accuracy (a recorded caveat)"
+          fi
+
+      - name: knip scan
+        continue-on-error: true
+        run: |
+          # --no-exit-code: knip exits non-zero when it finds issues; we want the
+          # report, not a failed step. Config is knip.jsonc.
+          npx --yes knip@5 --config .github/maintainability/knip.jsonc --reporter json --no-exit-code > knip-report.json 2> knip-stderr.txt || true
+          echo "--- knip stderr (tail) ---"
+          tail -30 knip-stderr.txt || true
+          echo "--- knip-report.json (head) ---"
+          head -c 2000 knip-report.json || true
+
+      - name: Verify knip produced a parseable report
+        if: always()
+        run: |
+          if [ ! -s knip-report.json ]; then
+            echo "::error::knip-report.json is missing or empty - knip did not run"
+            cat knip-stderr.txt || true
+            exit 1
+          fi
+          if ! jq -e 'type == "object" or type == "array"' knip-report.json >/dev/null 2>&1; then
+            echo "::error::knip-report.json is not valid JSON - knip failed"
+            cat knip-stderr.txt || true
+            exit 1
+          fi
+          echo "knip report is valid JSON"
+
+      - name: Summarise knip
+        if: always()
+        run: |
+          {
+            echo "## knip (dead code / unused deps)"
+            echo ""
+            echo "- install for resolution: **${KNIP_INSTALL}**"
+            echo ""
+            # knip json shape varies by version; count the common issue arrays defensively.
+            echo '```'
+            jq -r '
+              if type=="object" then
+                (["files","dependencies","devDependencies","optionalPeerDependencies","unlisted","binaries","unresolved","exports","nsExports","types","nsTypes","enumMembers","duplicates","classMembers"] as $keys
+                 | [ $keys[] | . as $k | {k:$k, n: (.[$k] | if type=="array" then length elif type=="object" then (.|length) else 0 end)} ]
+                 | .[] | select(.n>0) | "\(.k): \(.n)")
+              else
+                "issues (array form): \(length)"
+              end
+            ' knip-report.json 2>/dev/null || echo "(unreadable shape)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Record run-manifest fragment (knip)
+        if: always()
+        run: |
+          {
+            echo "## knip"
+            echo "version: $(npx --yes knip@5 --version 2>/dev/null || echo 'n/a')"
+            echo "install for resolution: ${KNIP_INSTALL}"
+            echo "scanned HEAD: $(git rev-parse HEAD 2>/dev/null || echo 'n/a')"
+          } > manifest-knip.txt
+
+      - name: Upload knip report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: maintainability-knip
+          path: |
+            knip-report.json
+            knip-stderr.txt
+            manifest-knip.txt
+          if-no-files-found: error
+
+  # ------------------------------------------------------------ module graph
+  dependency-cruiser:
+    name: Design - dependency-cruiser (module graph)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # No install needed: with `doNotFollow: node_modules` in the config the
+      # cruiser builds the graph from the local .js files and treats externals as
+      # leaf nodes, so it never needs the packages present.
+      - name: dependency-cruiser scan (JSON)
+        continue-on-error: true
+        run: |
+          npx --yes dependency-cruiser@16 \
+            app server.js config Gruntfile.js artifacts \
+            --config .github/maintainability/.dependency-cruiser.js \
+            --output-type json > depcruise.json 2> depcruise-stderr.txt || true
+          echo "--- stderr (tail) ---"; tail -20 depcruise-stderr.txt || true
+
+      - name: dependency-cruiser scan (human-readable violations)
+        continue-on-error: true
+        run: |
+          npx --yes dependency-cruiser@16 \
+            app server.js config Gruntfile.js artifacts \
+            --config .github/maintainability/.dependency-cruiser.js \
+            --output-type err-long > depcruise-violations.txt 2>&1 || true
+          echo "--- violations (tail) ---"; tail -40 depcruise-violations.txt || true
+
+      - name: Verify dependency-cruiser produced a parseable graph
+        if: always()
+        run: |
+          if [ ! -s depcruise.json ]; then
+            echo "::error::depcruise.json is missing or empty - dependency-cruiser did not run"
+            cat depcruise-stderr.txt || true
+            exit 1
+          fi
+          modules=$(jq -r '(.modules | length) // 0' depcruise.json)
+          echo "dependency-cruiser graphed $modules module(s)"
+          if [ "$modules" -eq 0 ]; then
+            echo "::error::dependency-cruiser graphed 0 modules - config is wrong, this is a null result not a clean graph"
+            cat depcruise-stderr.txt || true
+            exit 1
+          fi
+
+      - name: Summarise dependency-cruiser
+        if: always()
+        run: |
+          {
+            echo "## dependency-cruiser (module graph)"
+            echo ""
+            echo "- modules graphed: **$(jq -r '(.modules | length) // 0' depcruise.json)**"
+            echo "- rule violations: **$(jq -r '(.summary.violations | length) // 0' depcruise.json)**"
+            echo "  - errors: $(jq -r '.summary.error // 0' depcruise.json) · warnings: $(jq -r '.summary.warn // 0' depcruise.json) · info: $(jq -r '.summary.info // 0' depcruise.json)"
+            echo ""
+            echo "### Violations (rule -> module)"
+            echo ""
+            echo "| rule | severity | from | to |"
+            echo "|---|---|---|---|"
+            jq -r '.summary.violations[]? | "| \(.rule.name) | \(.rule.severity) | \(.from) | \(.to // "-") |"' depcruise.json 2>/dev/null || echo "| (none) | | | |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Record run-manifest fragment (dependency-cruiser)
+        if: always()
+        run: |
+          {
+            echo "## dependency-cruiser"
+            echo "version: $(npx --yes dependency-cruiser@16 --version 2>/dev/null || echo 'n/a')"
+            echo "scanned HEAD: $(git rev-parse HEAD 2>/dev/null || echo 'n/a')"
+          } > manifest-depcruise.txt
+
+      - name: Upload dependency-cruiser report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: maintainability-dependency-cruiser
+          path: |
+            depcruise.json
+            depcruise-violations.txt
+            depcruise-stderr.txt
+            manifest-depcruise.txt
+          if-no-files-found: error

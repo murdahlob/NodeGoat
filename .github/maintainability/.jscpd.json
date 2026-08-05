@@ -1,0 +1,19 @@
+{
+  "comment": "jscpd configuration for the phase-2 maintainability audit. Lives under .github/ (the scanning harness) so the application tree stays byte-identical to the pinned commit. Copy-paste detection over the application source only; the vendored third-party libraries and node_modules are excluded. min-tokens is left at the tool's own default of 50 so the reported volume is what a user gets out of the box; a sensitivity note on lower thresholds lives in the tool doc. See PLAN-003 and phase-2-tool-selection.md 4.5(a).",
+  "minTokens": 50,
+  "minLines": 5,
+  "mode": "mild",
+  "formatsExts": {
+    "javascript": ["js"],
+    "markup": ["html"]
+  },
+  "ignore": [
+    "**/node_modules/**",
+    "**/app/assets/vendor/**",
+    "**/.github/**",
+    "**/package-lock.json",
+    "**/jscpd-report/**"
+  ],
+  "absolute": false,
+  "gitignore": false
+}
