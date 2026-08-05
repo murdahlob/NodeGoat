@@ -462,6 +462,133 @@ jobs:
             echo "WORKING INVOCATION: semgrep scan --pro --config" | tee -a semgrep-custom-pro-log.txt
           fi
 
+      # ------------------------------------------ hop-isolation probe (B8)
+      # Rule B reported nothing on the first B8 run even under the Pro engine.
+      # "The taint rule found nothing" is not a usable result on its own: it is
+      # equally consistent with a broken rule, with `--pro` not actually
+      # enabling interfile analysis, and with the engine being unable to follow
+      # this particular code shape. Those three have completely different
+      # consequences for whether a paid dataflow engine is worth buying, so the
+      # ambiguity has to be resolved rather than reported.
+      #
+      # The probe is a ladder. Every rung has the same source (request data) and
+      # the same sink (a `$where` template literal); each adds exactly one more
+      # hop of indirection, ending at the shape the real defect has:
+      #   L1  cross-file, plain function                       <- interfile only
+      #   L2  cross-file, sink built inside a nested closure
+      #   L3  cross-file, method assigned to `this` in a constructor function
+      #   L4  L3 + the nested closure, i.e. the real shape
+      # Whichever rung stops firing is the hop the engine cannot follow, and if
+      # L1 itself does not fire then `--pro` never turned interfile on and the
+      # negative says nothing about the engine at all.
+      #
+      # Fixtures are written to RUNNER_TEMP, never into the repository. They are
+      # deliberately vulnerable JavaScript, and committing them would give every
+      # other scanner in this workflow new findings to report - corrupting the
+      # whole-tree counts of tools that have nothing to do with this experiment.
+      # Keeping them off-tree costs nothing: the content is right here in the
+      # YAML, so the probe stays reproducible.
+      - name: Interfile hop-isolation probe (Rule B)
+        continue-on-error: true
+        env:
+          SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+        run: |
+          P="${RUNNER_TEMP}/interfile-probe"
+          mkdir -p "$P"
+
+          cat > "$P/sink-lib.js" <<'EOF'
+          // Sink side of the ladder. One `$where` sink per rung; the rungs differ
+          // only in how much indirection sits between the caller and the sink.
+          function l1(coll, v) {
+              return coll.find({ $where: `this.n > '${v}'` });
+          }
+
+          function l2(coll, v) {
+              const build = () => ({ $where: `this.n > '${v}'` });
+              return coll.find(build());
+          }
+
+          const Dao3 = function (db) {
+              const coll = db.collection("x");
+              this.byCutoff = (v) => coll.find({ $where: `this.n > '${v}'` });
+          };
+
+          const Dao4 = function (db) {
+              const coll = db.collection("x");
+              this.byCutoff = (v) => {
+                  const build = () => ({ $where: `this.n > '${v}'` });
+                  return coll.find(build());
+              };
+          };
+
+          module.exports = { l1, l2, Dao3, Dao4 };
+          EOF
+
+          cat > "$P/route.js" <<'EOF'
+          // Source side of the ladder. Every handler reads the same request
+          // surface and hands it to one rung of sink-lib.js.
+          const { l1, l2, Dao3, Dao4 } = require("./sink-lib");
+
+          function handlers(db) {
+              const coll = db.collection("x");
+              const dao3 = new Dao3(db);
+              const dao4 = new Dao4(db);
+              return {
+                  h1: (req, res) => { const { cutoff } = req.query; l1(coll, cutoff); },
+                  h2: (req, res) => { const { cutoff } = req.query; l2(coll, cutoff); },
+                  h3: (req, res) => { const { cutoff } = req.query; dao3.byCutoff(cutoff); },
+                  h4: (req, res) => { const { cutoff } = req.query; dao4.byCutoff(cutoff); }
+              };
+          }
+
+          module.exports = handlers;
+          EOF
+
+          echo "=== probe fixtures ===" | tee interfile-probe-log.txt
+          for f in "$P"/*.js; do echo "--- $f"; cat -n "$f"; done | tee -a interfile-probe-log.txt
+
+          echo "=== semgrep scan --pro over the probe ===" | tee -a interfile-probe-log.txt
+          set +e
+          semgrep scan --pro \
+            --config "${GITHUB_WORKSPACE}/.github/semgrep-rules/" \
+            --metrics off \
+            --json --output interfile-probe.json \
+            "$P" 2>&1 | tee -a interfile-probe-log.txt
+          echo "probe exit code: ${PIPESTATUS[0]}" | tee -a interfile-probe-log.txt
+          set -e
+
+      - name: Report which hop the taint engine loses
+        if: always()
+        run: |
+          {
+            echo "## Interfile hop-isolation probe"
+            echo ""
+            echo "Rung fires => the engine followed that much indirection."
+            echo "Rule A (sink-only) should fire on ALL four regardless - it is"
+            echo "the taint rule's column that carries the information."
+            echo ""
+            if [ -s interfile-probe.json ]; then
+              echo '```'
+              jq -r '.results[] | (.check_id | split(".") | last) + "  " +
+                     (.path | split("/") | last) + ":" + (.start.line|tostring)' \
+                 interfile-probe.json 2>/dev/null | sort || echo "(parse error)"
+              echo '```'
+              t=$(jq '[.results[] | select(.check_id | endswith("tainted-server-side-js"))] | length' interfile-probe.json 2>/dev/null || echo "?")
+              a=$(jq '[.results[] | select(.check_id | endswith("dynamic-server-side-js"))] | length' interfile-probe.json 2>/dev/null || echo "?")
+              echo ""
+              echo "Rule A (sink-only) hits: **$a** of 4 rungs"
+              echo "Rule B (taint)     hits: **$t** of 4 rungs"
+              echo ""
+              if [ "$t" = "0" ]; then
+                echo "**Rule B fired on no rung at all, including L1 (plain cross-file call).**"
+                echo "That is the simplest interfile case there is, so this is evidence about"
+                echo "the invocation or the rule - NOT about the engine's depth limit."
+              fi
+            else
+              echo "**probe produced no JSON** - see interfile-probe-log.txt in the artifact"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
       # The experiment's actual readout, in the job summary so it survives even
       # if the artifacts are never downloaded. Reports per variant: how many
       # findings, where, and - for the taint variant - whether any dataflow
@@ -541,6 +668,8 @@ jobs:
           path: |
             semgrep-custom-pro.sarif
             semgrep-custom-pro-log.txt
+            interfile-probe.json
+            interfile-probe-log.txt
           if-no-files-found: warn
 
       # Distinct category so the custom rules never overwrite - or get counted
