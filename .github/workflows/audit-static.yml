@@ -478,9 +478,19 @@ jobs:
       #   L2  cross-file, sink built inside a nested closure
       #   L3  cross-file, method assigned to `this` in a constructor function
       #   L4  L3 + the nested closure, i.e. the real shape
+      #   L5  ES6 class with a real method                     <- modern idiom
+      #   L6  factory returning an object literal with a method
       # Whichever rung stops firing is the hop the engine cannot follow, and if
       # L1 itself does not fire then `--pro` never turned interfile on and the
       # negative says nothing about the engine at all.
+      #
+      # L5 and L6 exist to keep the conclusion from being overstated. L3/L4 use
+      # the 2016-era `function Dao(){ this.method = ... }` pseudo-class, which is
+      # what this target happens to be written in. If the engine also loses L5
+      # and L6 then it cannot follow data into a method at all, which is a severe
+      # and general limitation; if it follows them, the gap is specific to a
+      # legacy idiom and is a footnote rather than a reason not to buy. Those two
+      # readings support opposite recommendations, so both rungs are measured.
       #
       # Fixtures are written to RUNNER_TEMP, never into the repository. They are
       # deliberately vulnerable JavaScript, and committing them would give every
@@ -521,23 +531,43 @@ jobs:
               };
           };
 
-          module.exports = { l1, l2, Dao3, Dao4 };
+          class Dao5 {
+              constructor(db) {
+                  this.coll = db.collection("x");
+              }
+              byCutoff(v) {
+                  return this.coll.find({ $where: `this.n > '${v}'` });
+              }
+          }
+
+          function makeDao6(db) {
+              const coll = db.collection("x");
+              return {
+                  byCutoff: (v) => coll.find({ $where: `this.n > '${v}'` })
+              };
+          }
+
+          module.exports = { l1, l2, Dao3, Dao4, Dao5, makeDao6 };
           EOF
 
           cat > "$P/route.js" <<'EOF'
           // Source side of the ladder. Every handler reads the same request
           // surface and hands it to one rung of sink-lib.js.
-          const { l1, l2, Dao3, Dao4 } = require("./sink-lib");
+          const { l1, l2, Dao3, Dao4, Dao5, makeDao6 } = require("./sink-lib");
 
           function handlers(db) {
               const coll = db.collection("x");
               const dao3 = new Dao3(db);
               const dao4 = new Dao4(db);
+              const dao5 = new Dao5(db);
+              const dao6 = makeDao6(db);
               return {
                   h1: (req, res) => { const { cutoff } = req.query; l1(coll, cutoff); },
                   h2: (req, res) => { const { cutoff } = req.query; l2(coll, cutoff); },
                   h3: (req, res) => { const { cutoff } = req.query; dao3.byCutoff(cutoff); },
-                  h4: (req, res) => { const { cutoff } = req.query; dao4.byCutoff(cutoff); }
+                  h4: (req, res) => { const { cutoff } = req.query; dao4.byCutoff(cutoff); },
+                  h5: (req, res) => { const { cutoff } = req.query; dao5.byCutoff(cutoff); },
+                  h6: (req, res) => { const { cutoff } = req.query; dao6.byCutoff(cutoff); }
               };
           }
 
@@ -576,8 +606,8 @@ jobs:
               t=$(jq '[.results[] | select(.check_id | endswith("tainted-server-side-js"))] | length' interfile-probe.json 2>/dev/null || echo "?")
               a=$(jq '[.results[] | select(.check_id | endswith("dynamic-server-side-js"))] | length' interfile-probe.json 2>/dev/null || echo "?")
               echo ""
-              echo "Rule A (sink-only) hits: **$a** of 4 rungs"
-              echo "Rule B (taint)     hits: **$t** of 4 rungs"
+              echo "Rule A (sink-only) hits: **$a** of 6 rungs"
+              echo "Rule B (taint)     hits: **$t** of 6 rungs"
               echo ""
               if [ "$t" = "0" ]; then
                 echo "**Rule B fired on no rung at all, including L1 (plain cross-file call).**"
